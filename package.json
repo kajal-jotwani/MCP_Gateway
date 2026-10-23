@@ -4,7 +4,8 @@
   "type": "module",
   "workspaces": [
     "woo-mcp",
-    "notes-mcp"
+    "notes-mcp",
+    "gateway"
   ],
   "engines": {
     "node": ">=22.12"
