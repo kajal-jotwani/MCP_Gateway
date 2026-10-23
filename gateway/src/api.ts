@@ -6,6 +6,7 @@ import { createApiKey, getApiKey, listApiKeys, revokeApiKey } from './apiKeys.js
 import { listAuditEntries } from './audit.js';
 import type { Database } from './db.js';
 import { auditScopeOf, isAdmin, mayManageKeysOf, memberChangeRefusal } from './permissions.js';
+import type { UpstreamRegistry, UpstreamState } from './registry.js';
 import {
   acceptInvite,
   authenticatePassword,
@@ -23,6 +24,16 @@ import {
   updateMember,
 } from './team.js';
 import type { Member } from './team.js';
+import {
+  createUpstream,
+  deleteUpstream,
+  listUpstreamConfigs,
+  listUpstreams,
+  SLUG_PATTERN,
+  slugFromName,
+  updateUpstream,
+} from './upstreams.js';
+import type { Upstream } from './upstreams.js';
 
 /** An error whose status and message are meant for the browser. */
 export class HttpError extends Error {
@@ -36,6 +47,7 @@ export class HttpError extends Error {
 
 export interface ApiDeps {
   db: Database;
+  registry: UpstreamRegistry;
   publicUrl: URL;
 }
 
@@ -68,6 +80,70 @@ const auditQuery = z.object({
     .regex(/^\d{1,18}$/)
     .optional(),
   limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+
+// Headers the MCP transport sets itself or that change HTTP framing. A credential cannot replace them.
+const RESERVED_HEADERS = new Set([
+  'accept',
+  'connection',
+  'content-length',
+  'content-type',
+  'host',
+  'keep-alive',
+  'last-event-id',
+  'mcp-protocol-version',
+  'mcp-session-id',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
+
+const slugSchema = z.string().regex(SLUG_PATTERN, 'must be 2-16 characters of a-z, 0-9 and -');
+const upstreamUrlSchema = z
+  .url({ protocol: /^https?$/ })
+  .max(2048)
+  .refine((url) => {
+    const parsed = new URL(url);
+    return !parsed.username && !parsed.password;
+  }, 'must not contain a user name or password; use the credential fields');
+// fetch only sends printable ASCII header values, and a line break would split the header.
+const secretSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(4096)
+  .regex(/^[\x20-\x7e]+$/, 'must be printable ASCII on one line');
+const headerNameSchema = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .regex(/^[a-z0-9!#$%&'*+.^_`|~-]{1,64}$/, 'must be a valid HTTP header name')
+  .refine((name) => !RESERVED_HEADERS.has(name), 'is set by the gateway and cannot carry a credential');
+const newAuthSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('none') }),
+  z.object({ type: z.literal('bearer'), secret: secretSchema }),
+  z.object({ type: z.literal('header'), headerName: headerNameSchema, secret: secretSchema }),
+]);
+const changedAuthSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('none') }),
+  z.object({ type: z.literal('bearer'), secret: secretSchema.optional() }),
+  z.object({ type: z.literal('header'), headerName: headerNameSchema, secret: secretSchema.optional() }),
+]);
+const upstreamNameSchema = z.string().trim().min(1).max(100);
+const upstreamBody = z.object({
+  name: upstreamNameSchema,
+  slug: slugSchema.optional(),
+  url: upstreamUrlSchema,
+  auth: newAuthSchema.default({ type: 'none' }),
+  enabled: z.boolean().default(true),
+});
+const upstreamPatchBody = z.object({
+  name: upstreamNameSchema.optional(),
+  slug: slugSchema.optional(),
+  url: upstreamUrlSchema.optional(),
+  auth: changedAuthSchema.optional(),
+  enabled: z.boolean().optional(),
 });
 
 /** Validates request input at the boundary. Throws HttpError 400 with what was wrong. */
@@ -115,10 +191,48 @@ function requireCustomHeader(req: Request, _res: Response, next: NextFunction): 
   next();
 }
 
+/**
+ * An upstream with its live status and tools. Members get no URL or credential details, since they
+ * only need to know which tools exist.
+ */
+function upstreamView(upstream: Upstream, state: UpstreamState | undefined, admin: boolean) {
+  const { url, authType, authHeaderName, ...visible } = upstream;
+  return {
+    ...visible,
+    ...(admin && { url, authType, authHeaderName }),
+    status: state?.status ?? (upstream.enabled ? 'unreachable' : 'disabled'),
+    error: state?.error ?? null,
+    checkedAt: state?.checkedAt ?? null,
+    tools: (state?.tools ?? []).map(({ name, originalName, tool }) => ({
+      name,
+      originalName,
+      title: tool.title ?? null,
+      description: tool.description ?? null,
+    })),
+  };
+}
+
+function upstreamChangeRefusal(outcome: 'slug_taken' | 'secret_required'): HttpError {
+  return outcome === 'slug_taken'
+    ? new HttpError(409, 'Another server already uses this slug.')
+    : new HttpError(400, 'Enter the secret. It is required for this credential type and after a URL change.');
+}
+
 /** The dashboard API under /api. Humans authenticate with a session cookie set by /api/login. */
-export function createApiRouter({ db, publicUrl }: ApiDeps): Router {
+export function createApiRouter({ db, registry, publicUrl }: ApiDeps): Router {
   const router = express.Router();
   const secureCookie = publicUrl.protocol === 'https:';
+
+  // Serialized, so when edits overlap the last sync reads the latest rows.
+  let upstreamsApplied = Promise.resolve();
+  const applyUpstreamChanges = (): Promise<void> => {
+    const next = upstreamsApplied.then(async () => registry.sync(await listUpstreamConfigs(db)));
+    upstreamsApplied = next.catch(() => undefined);
+    return next;
+  };
+  const upstreamResponse = (upstream: Upstream) => ({
+    upstream: upstreamView(upstream, registry.states().get(upstream.id), true),
+  });
 
   const startSession = async (res: Response, member: Member): Promise<void> => {
     res.cookie(SESSION_COOKIE, await createSession(db, member.id), {
@@ -243,6 +357,51 @@ export function createApiRouter({ db, publicUrl }: ApiDeps): Router {
     const actor = signedInMember(res);
     const { before, limit } = parse(auditQuery, req.query);
     res.json({ entries: await listAuditEntries(db, { memberId: auditScopeOf(actor), before, limit }) });
+  });
+
+  router.get('/upstreams', async (_req, res) => {
+    const admin = isAdmin(signedInMember(res));
+    const states = registry.states();
+    const upstreams = await listUpstreams(db);
+    res.json({
+      upstreams: upstreams.map((upstream) => upstreamView(upstream, states.get(upstream.id), admin)),
+    });
+  });
+
+  // Each change is applied to the registry before responding, so the response carries the new status.
+  router.post('/upstreams', async (req, res) => {
+    signedInAdmin(res);
+    const { slug, ...input } = parse(upstreamBody, req.body);
+    const derivedSlug = slug ?? slugFromName(input.name);
+    if (!SLUG_PATTERN.test(derivedSlug)) {
+      throw new HttpError(400, 'Enter a slug of 2-16 characters of a-z, 0-9 and -.');
+    }
+    const created = await createUpstream(db, { ...input, slug: derivedSlug });
+    if (typeof created === 'string') throw upstreamChangeRefusal(created);
+    await applyUpstreamChanges();
+    res.status(201).json(upstreamResponse(created));
+  });
+
+  router.patch('/upstreams/:id', async (req, res) => {
+    signedInAdmin(res);
+    const changes = parse(upstreamPatchBody, req.body);
+    const updated = await updateUpstream(db, parseId(req.params.id), changes);
+    if (!updated) throw new HttpError(404, 'Not found.');
+    if (typeof updated === 'string') throw upstreamChangeRefusal(updated);
+    await applyUpstreamChanges();
+    res.json(upstreamResponse(updated));
+  });
+
+  router.delete('/upstreams/:id', async (req, res) => {
+    signedInAdmin(res);
+    if (!(await deleteUpstream(db, parseId(req.params.id)))) throw new HttpError(404, 'Not found.');
+    await applyUpstreamChanges();
+    res.status(204).end();
+  });
+
+  // Without this, an unknown /api path would fall through to the dashboard's index.html.
+  router.use(() => {
+    throw new HttpError(404, 'Not found.');
   });
 
   return router;

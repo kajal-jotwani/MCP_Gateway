@@ -1,8 +1,11 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { createApiKey } from '../src/apiKeys.js';
 import { createApp } from '../src/app.js';
@@ -21,16 +24,30 @@ const ADMIN = { email: 'admin@example.com', password: 'admin-password-123' };
 const PASSWORD = 'member-password-123';
 
 let db: Database;
+let dashboardDir: string;
 let emailCounter = 0;
 let upstreamCounter = 0;
+
+/** A database of its own with the first admin, for tests whose gateway syncs every upstream row. */
+async function isolatedDatabase(): Promise<Database> {
+  const isolated = await createTestDatabase();
+  await ensureFirstAdmin(isolated, ADMIN);
+  onCleanup(() => isolated.close());
+  return isolated;
+}
 
 beforeAll(async () => {
   db = await createTestDatabase();
   await ensureFirstAdmin(db, ADMIN);
+  dashboardDir = await mkdtemp(join(tmpdir(), 'dashboard-'));
+  await mkdir(join(dashboardDir, 'assets'));
+  await writeFile(join(dashboardDir, 'index.html'), '<!doctype html><title>Dashboard</title>');
+  await writeFile(join(dashboardDir, 'assets', 'index-abc123.js'), 'console.log(1);');
 });
 
 afterAll(async () => {
   await db.close();
+  await rm(dashboardDir, { recursive: true });
 });
 
 afterEach(runCleanups);
@@ -40,19 +57,27 @@ interface Gateway {
   upstream: FakeUpstream;
 }
 
-/** Starts the gateway's HTTP app on a free port, with one upstream named WooCommerce. */
-async function startGateway(): Promise<Gateway> {
+/**
+ * Starts the gateway's HTTP app on a free port, with one upstream named WooCommerce. With the shared
+ * database, the gateway starts out seeing only its own upstream row.
+ */
+async function startGateway(database: Database = db): Promise<Gateway> {
   const upstream = await startUpstream(['list_orders', 'fail', 'sleep']);
   upstreamCounter += 1;
-  const [{ id }] = (await db.query<{ id: string }>(
+  const [{ id }] = (await database.query<{ id: string }>(
     `INSERT INTO upstreams (slug, name, url, auth_type) VALUES ($1, 'WooCommerce', $2, 'none') RETURNING id`,
     [`woo${upstreamCounter}`, upstream.url],
   )) as [{ id: string }];
   const registry = new UpstreamRegistry({ connectMs: 500, listMs: 500, callMs: 300 });
-  // Each test's gateway sees only its own upstream row; the database is shared by the whole file.
-  await registry.sync((await listUpstreamConfigs(db)).filter((config) => config.id === id));
-  const mcpHandler = createGatewayMcpHandler({ db, registry });
-  const app = createApp({ db, mcpHandler, publicUrl: new URL('http://app.localtest.me') });
+  await registry.sync((await listUpstreamConfigs(database)).filter((config) => config.id === id));
+  const mcpHandler = createGatewayMcpHandler({ db: database, registry });
+  const app = createApp({
+    db: database,
+    registry,
+    mcpHandler,
+    publicUrl: new URL('http://app.localtest.me'),
+    dashboardDir,
+  });
   const server: Server = await new Promise((resolve) => {
     const listening = app.listen(0, '127.0.0.1', () => resolve(listening));
   });
@@ -95,9 +120,9 @@ class Browser {
   }
 }
 
-async function newMember(role: Role = 'member'): Promise<Member> {
+async function newMember(role: Role = 'member', database: Database = db): Promise<Member> {
   emailCounter += 1;
-  const member = await createMember(db, {
+  const member = await createMember(database, {
     email: `person${emailCounter}@example.com`,
     name: `Person ${emailCounter}`,
     role,
@@ -122,6 +147,11 @@ async function mcpClient(gateway: Gateway, key: string | undefined): Promise<Cli
   );
   onCleanup(() => client.close());
   return client;
+}
+
+async function newKey(database: Database, member: Member): Promise<string> {
+  const { key } = await createApiKey(database, { memberId: member.id, name: 'cli', createdBy: member.id });
+  return key;
 }
 
 async function auditEntries(gateway: Gateway): Promise<AuditEntry[]> {
@@ -425,6 +455,175 @@ describe('MCP endpoint with API keys', () => {
     const entries = (await browser.request('GET', '/audit')).body.entries as AuditEntry[];
     expect(entries.length).toBeGreaterThan(0);
     expect(entries.every((entry) => entry.memberId === member.id)).toBe(true);
+  });
+});
+
+describe('upstream servers', () => {
+  const NOTES_TOKEN = 'notes-secret-token';
+  // The gateway syncs every upstream row after a change, so each test needs a database of its own.
+  let isolated: Database;
+  beforeEach(async () => {
+    isolated = await isolatedDatabase();
+  });
+
+  it('lets admins add a server with a credential and shows its status and tools right away', async () => {
+    const gateway = await startGateway(isolated);
+    const notes = await startUpstream(['save_note', 'list_orders'], { token: NOTES_TOKEN });
+    onCleanup(() => notes.close());
+    const admin = await adminBrowser(gateway);
+
+    const created = await admin.request('POST', '/upstreams', {
+      name: 'Notes',
+      url: notes.url,
+      auth: { type: 'bearer', secret: NOTES_TOKEN },
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.upstream).toMatchObject({
+      slug: 'notes',
+      name: 'Notes',
+      authType: 'bearer',
+      status: 'connected',
+      error: null,
+    });
+    const tools = (created.body.upstream as { tools: { name: string; originalName: string }[] }).tools;
+    expect(tools).toEqual([
+      expect.objectContaining({ name: 'notes__list_orders', originalName: 'list_orders' }),
+      expect.objectContaining({ name: 'save_note', originalName: 'save_note' }),
+    ]);
+    const listed = await admin.request('GET', '/upstreams');
+    expect(JSON.stringify([created.body, listed.body])).not.toContain(NOTES_TOKEN);
+
+    const client = await mcpClient(gateway, await newKey(isolated, await newMember('member', isolated)));
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual([
+      'fail',
+      'notes__list_orders',
+      'save_note',
+      'sleep',
+      expect.stringMatching(/^woo\d+__list_orders$/),
+    ]);
+    expect(text(await client.callTool({ name: 'save_note', arguments: {} }))).toBe('save_note done');
+    expect(notes.calls[0]?.authorization).toBe(`Bearer ${NOTES_TOKEN}`);
+  });
+
+  it('shows members servers and tools without URLs or credentials, and keeps them from changes', async () => {
+    const gateway = await startGateway(isolated);
+    const member = await newMember('member', isolated);
+    const browser = await new Browser(gateway).login(member.email, PASSWORD);
+
+    const { body } = await browser.request('GET', '/upstreams');
+    const [upstream] = body.upstreams as Record<string, unknown>[];
+    expect(Object.keys(upstream!).sort()).toEqual([
+      'checkedAt',
+      'enabled',
+      'error',
+      'id',
+      'name',
+      'slug',
+      'status',
+      'tools',
+    ]);
+    expect((await browser.request('POST', '/upstreams', { name: 'X', url: 'http://x' })).status).toBe(403);
+    expect((await browser.request('PATCH', `/upstreams/${upstream!.id}`, { enabled: false })).status).toBe(
+      403,
+    );
+    expect((await browser.request('DELETE', `/upstreams/${upstream!.id}`)).status).toBe(403);
+  });
+
+  it('keeps the stored secret on edits but requires it again when the URL changes', async () => {
+    const gateway = await startGateway(isolated);
+    const notes = await startUpstream(['save_note'], { token: NOTES_TOKEN });
+    onCleanup(() => notes.close());
+    const admin = await adminBrowser(gateway);
+    const created = await admin.request('POST', '/upstreams', {
+      name: 'Notes',
+      url: notes.url,
+      auth: { type: 'bearer', secret: NOTES_TOKEN },
+    });
+    const id = (created.body.upstream as { id: string }).id;
+
+    const renamed = await admin.request('PATCH', `/upstreams/${id}`, { name: 'Team notes' });
+    expect(renamed.body.upstream).toMatchObject({
+      name: 'Team notes',
+      authType: 'bearer',
+      status: 'connected',
+    });
+
+    const moved = await admin.request('PATCH', `/upstreams/${id}`, { url: `${notes.url}?v=2` });
+    expect(moved.status).toBe(400);
+    const movedWithSecret = await admin.request('PATCH', `/upstreams/${id}`, {
+      url: `${notes.url}?v=2`,
+      auth: { type: 'bearer', secret: NOTES_TOKEN },
+    });
+    expect(movedWithSecret.body.upstream).toMatchObject({ status: 'connected' });
+  });
+
+  it('hides a disabled server’s tools from MCP clients and brings them back when enabled', async () => {
+    const gateway = await startGateway(isolated);
+    const admin = await adminBrowser(gateway);
+    const [upstream] = (await admin.request('GET', '/upstreams')).body.upstreams as { id: string }[];
+    const client = await mcpClient(gateway, await newKey(isolated, await newMember('member', isolated)));
+
+    const disabled = await admin.request('PATCH', `/upstreams/${upstream!.id}`, { enabled: false });
+    expect(disabled.body.upstream).toMatchObject({ enabled: false, status: 'disabled', tools: [] });
+    expect((await client.listTools()).tools).toEqual([]);
+    expect(text(await client.callTool({ name: 'list_orders', arguments: {} }))).toMatch(/^Unknown tool/);
+
+    await admin.request('PATCH', `/upstreams/${upstream!.id}`, { enabled: true });
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual([
+      'fail',
+      'list_orders',
+      'sleep',
+    ]);
+  });
+
+  it('removes a server and keeps its audit entries readable', async () => {
+    const gateway = await startGateway(isolated);
+    const admin = await adminBrowser(gateway);
+    const [upstream] = (await admin.request('GET', '/upstreams')).body.upstreams as { id: string }[];
+    const member = await newMember('member', isolated);
+    await (
+      await mcpClient(gateway, await newKey(isolated, member))
+    ).callTool({ name: 'list_orders', arguments: {} });
+
+    expect((await admin.request('DELETE', `/upstreams/${upstream!.id}`)).status).toBe(204);
+    expect((await admin.request('GET', '/upstreams')).body.upstreams).toEqual([]);
+    const [entry] = (await auditEntries(gateway)).filter((e) => e.memberId === member.id);
+    expect(entry).toMatchObject({ upstreamName: 'WooCommerce', tool: 'list_orders', outcome: 'succeeded' });
+  });
+
+  it('rejects credentials in URLs, reserved header names, multi-line secrets and taken slugs', async () => {
+    const gateway = await startGateway(isolated);
+    const admin = await adminBrowser(gateway);
+    const add = (body: unknown) => admin.request('POST', '/upstreams', body);
+
+    expect((await add({ name: 'A', url: 'http://user:pass@notes:3000/mcp' })).status).toBe(400);
+    expect((await add({ name: 'A', url: 'file:///etc/passwd' })).status).toBe(400);
+    const reserved = { type: 'header', headerName: 'Content-Type', secret: 'x' };
+    expect((await add({ name: 'A', url: 'http://notes/mcp', auth: reserved })).status).toBe(400);
+    const multiLine = { type: 'bearer', secret: 'abc\r\nX-Injected: 1' };
+    expect((await add({ name: 'A', url: 'http://notes/mcp', auth: multiLine })).status).toBe(400);
+    expect((await add({ name: 'A', url: 'http://notes/mcp', auth: { type: 'bearer' } })).status).toBe(400);
+    const [existing] = (await admin.request('GET', '/upstreams')).body.upstreams as { slug: string }[];
+    expect((await add({ name: 'Copy', slug: existing!.slug, url: 'http://notes/mcp' })).status).toBe(409);
+  });
+});
+
+describe('dashboard files', () => {
+  it('serves the dashboard for browser routes, with security headers, but not for unknown API paths', async () => {
+    const gateway = await startGateway();
+
+    const page = await fetch(`${gateway.url}/servers`);
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain('<title>Dashboard</title>');
+    expect(page.headers.get('content-security-policy')).toContain("default-src 'self'");
+    expect(page.headers.get('x-content-type-options')).toBe('nosniff');
+
+    const asset = await fetch(`${gateway.url}/assets/index-abc123.js`);
+    expect(asset.headers.get('cache-control')).toContain('immutable');
+
+    const unknownApi = await fetch(`${gateway.url}/api/nothing-here`);
+    expect(unknownApi.status).toBe(404);
+    expect(await unknownApi.json()).toEqual({ error: 'Not found.' });
   });
 });
 

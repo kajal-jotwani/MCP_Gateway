@@ -1,3 +1,6 @@
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
 import { createApp } from './app.js';
 import { loadConfig } from './config.js';
 import type { GatewayConfig } from './config.js';
@@ -11,12 +14,18 @@ import { listUpstreamConfigs, seedUpstreamOnce } from './upstreams.js';
 // writes can be slow; woo-mcp's own 20 s store timeout fires first and returns a clearer error.
 const TIMEOUTS = { connectMs: 5000, listMs: 5000, callMs: 30_000 };
 const REFRESH_INTERVAL_MS = 15_000;
+// gateway/dist/main.js -> dashboard/dist, the same layout in the repository and in the image.
+const DASHBOARD_DIR = fileURLToPath(new URL('../../dashboard/dist/', import.meta.url));
 
 let config: GatewayConfig;
 try {
   config = loadConfig(process.env);
 } catch (error) {
   console.error((error as Error).message);
+  process.exit(1);
+}
+if (!existsSync(`${DASHBOARD_DIR}index.html`)) {
+  console.error(`The dashboard is not built: ${DASHBOARD_DIR}index.html is missing. Run npm run build.`);
   process.exit(1);
 }
 
@@ -34,7 +43,7 @@ if (await seedUpstreamOnce(db, config.seedUpstream)) {
 
 const registry = new UpstreamRegistry(TIMEOUTS);
 const mcpHandler = createGatewayMcpHandler({ db, registry });
-const app = createApp({ db, mcpHandler, publicUrl: config.publicUrl });
+const app = createApp({ db, registry, mcpHandler, publicUrl: config.publicUrl, dashboardDir: DASHBOARD_DIR });
 const server = app.listen(config.port, () => {
   console.log(JSON.stringify({ event: 'listening', port: config.port }));
 });

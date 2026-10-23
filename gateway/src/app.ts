@@ -1,3 +1,5 @@
+import { join, sep } from 'node:path';
+
 import { toNodeHandler } from '@modelcontextprotocol/node';
 import type { McpHttpHandler } from '@modelcontextprotocol/server';
 import express from 'express';
@@ -13,7 +15,17 @@ import type { Caller } from './toolCalls.js';
 
 export interface AppDeps extends ApiDeps {
   mcpHandler: McpHttpHandler;
+  /** Absolute path of the built dashboard (dashboard/dist). */
+  dashboardDir: string;
 }
+
+// The dashboard loads only its own bundled scripts and styles; nothing inline, nothing third-party.
+const SECURITY_HEADERS = {
+  'content-security-policy':
+    "default-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+  'x-content-type-options': 'nosniff',
+  'referrer-policy': 'no-referrer',
+};
 
 function bearerToken(req: Request): string | undefined {
   const header = req.get('authorization');
@@ -97,12 +109,17 @@ function handleError(error: unknown, req: Request, res: Response, next: NextFunc
 }
 
 /**
- * The gateway's HTTP surface: /mcp for MCP clients with an API key, /api for the dashboard, and the
- * probes. /readyz checks only the database, so a dead upstream never takes the gateway out of service.
+ * The gateway's HTTP surface: /mcp for MCP clients with an API key, /api and the dashboard for people,
+ * and the probes. /readyz checks only the database, so a dead upstream never takes the gateway out of
+ * service.
  */
 export function createApp(deps: AppDeps): Express {
   const app = express();
   app.disable('x-powered-by');
+  app.use((_req, res, next) => {
+    res.set(SECURITY_HEADERS);
+    next();
+  });
 
   app.get('/healthz', (_req, res) => {
     res.type('text/plain').send('ok');
@@ -122,6 +139,21 @@ export function createApp(deps: AppDeps): Express {
   });
 
   app.use('/api', createApiRouter(deps));
+
+  // Vite puts content hashes in asset file names, so they can be cached forever; index.html cannot.
+  app.use(
+    express.static(deps.dashboardDir, {
+      index: false,
+      setHeaders: (res, path) => {
+        if (path.includes(`${sep}assets${sep}`))
+          res.set('cache-control', 'public, max-age=31536000, immutable');
+      },
+    }),
+  );
+  // The dashboard routes in the browser, so every other GET serves its entry page.
+  app.get('/{*path}', (_req, res) => {
+    res.set('cache-control', 'no-cache').sendFile(join(deps.dashboardDir, 'index.html'));
+  });
   app.use(handleError);
   return app;
 }

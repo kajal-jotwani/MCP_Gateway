@@ -2,6 +2,7 @@ import * as z from 'zod/v4';
 
 import type { PostgresSettings } from './db.js';
 import { MIN_PASSWORD_LENGTH } from './team.js';
+import { SLUG_PATTERN } from './upstreams.js';
 
 export interface GatewayConfig {
   port: number;
@@ -29,7 +30,7 @@ const envSchema = z.object({
     .string()
     .min(MIN_PASSWORD_LENGTH, `must be at least ${MIN_PASSWORD_LENGTH} characters`),
   SEED_UPSTREAM_NAME: z.string().min(1).max(100),
-  SEED_UPSTREAM_SLUG: z.string().regex(/^[a-z0-9-]{2,16}$/, 'must be 2-16 characters of a-z, 0-9 and -'),
+  SEED_UPSTREAM_SLUG: z.string().regex(SLUG_PATTERN, 'must be 2-16 characters of a-z, 0-9 and -'),
   SEED_UPSTREAM_URL: httpUrl,
 });
 
