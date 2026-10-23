@@ -2,8 +2,12 @@ import express from 'express';
 import type { NextFunction, Request, Response, Router } from 'express';
 import * as z from 'zod/v4';
 
+import type Anthropic from '@anthropic-ai/sdk';
+
 import { createApiKey, getApiKey, listApiKeys, revokeApiKey } from './apiKeys.js';
 import { listAuditEntries } from './audit.js';
+import { chatFailureMessage, runChatTurn } from './chat.js';
+import type { ChatEvent, ChatTurn } from './chat.js';
 import type { Database } from './db.js';
 import { auditScopeOf, isAdmin, mayManageKeysOf, memberChangeRefusal } from './permissions.js';
 import type { UpstreamRegistry, UpstreamState } from './registry.js';
@@ -48,6 +52,7 @@ export class HttpError extends Error {
 export interface ApiDeps {
   db: Database;
   registry: UpstreamRegistry;
+  anthropic: Anthropic;
   publicUrl: URL;
 }
 
@@ -146,6 +151,19 @@ const upstreamPatchBody = z.object({
   enabled: z.boolean().optional(),
 });
 
+const chatBody = z.object({
+  messages: z
+    .array(z.object({ role: z.enum(['user', 'assistant']), text: z.string().trim().min(1).max(20_000) }))
+    .min(1)
+    .max(50)
+    .refine(
+      (turns: ChatTurn[]) =>
+        turns.every((turn, index) => turn.role === (index % 2 === 0 ? 'user' : 'assistant')) &&
+        turns.length % 2 === 1,
+      'must alternate between user and assistant, starting and ending with user',
+    ),
+});
+
 /** Validates request input at the boundary. Throws HttpError 400 with what was wrong. */
 function parse<T>(schema: z.ZodType<T>, value: unknown): T {
   const parsed = schema.safeParse(value);
@@ -219,7 +237,7 @@ function upstreamChangeRefusal(outcome: 'slug_taken' | 'secret_required'): HttpE
 }
 
 /** The dashboard API under /api. Humans authenticate with a session cookie set by /api/login. */
-export function createApiRouter({ db, registry, publicUrl }: ApiDeps): Router {
+export function createApiRouter({ db, registry, anthropic, publicUrl }: ApiDeps): Router {
   const router = express.Router();
   const secureCookie = publicUrl.protocol === 'https:';
 
@@ -397,6 +415,34 @@ export function createApiRouter({ db, registry, publicUrl }: ApiDeps): Router {
     if (!(await deleteUpstream(db, parseId(req.params.id)))) throw new HttpError(404, 'Not found.');
     await applyUpstreamChanges();
     res.status(204).end();
+  });
+
+  // Streams the turn as newline-delimited JSON, so the dashboard can show text and tool calls as they
+  // happen. The browser holds the conversation and sends it with each message.
+  router.post('/chat', async (req, res) => {
+    const member = signedInMember(res);
+    const { messages } = parse(chatBody, req.body);
+    const disconnected = new AbortController();
+    res.on('close', () => disconnected.abort());
+    res.status(200).set({ 'content-type': 'application/x-ndjson', 'cache-control': 'no-store' });
+    const emit = (event: ChatEvent) => res.write(`${JSON.stringify(event)}\n`);
+    const started = Date.now();
+    try {
+      await runChatTurn({ db, registry, anthropic }, member, messages, emit, disconnected.signal);
+    } catch (error) {
+      if (!disconnected.signal.aborted) {
+        console.error(
+          JSON.stringify({
+            event: 'chat_failed',
+            memberId: member.id,
+            durationMs: Date.now() - started,
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
+        emit({ type: 'error', message: chatFailureMessage(error) });
+      }
+    }
+    res.end();
   });
 
   // Without this, an unknown /api path would fall through to the dashboard's index.html.

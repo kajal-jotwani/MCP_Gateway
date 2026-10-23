@@ -13,6 +13,7 @@ const validEnv = {
   SEED_UPSTREAM_NAME: 'WooCommerce',
   SEED_UPSTREAM_SLUG: 'woocommerce',
   SEED_UPSTREAM_URL: 'http://woo-mcp.store.svc.cluster.local:3000/mcp',
+  ANTHROPIC_API_KEY: 'test-anthropic-key',
 };
 
 describe('loadConfig', () => {
@@ -35,6 +36,7 @@ describe('loadConfig', () => {
       loadConfig({
         ...validEnv,
         PGPASSWORD: undefined,
+        ANTHROPIC_API_KEY: '',
         BOOTSTRAP_ADMIN_PASSWORD: shortPassword,
         SEED_UPSTREAM_SLUG: 'Not A Slug',
       });
@@ -42,6 +44,7 @@ describe('loadConfig', () => {
       message = (error as Error).message;
     }
     expect(message).toContain('PGPASSWORD');
+    expect(message).toContain('ANTHROPIC_API_KEY');
     expect(message).toContain('BOOTSTRAP_ADMIN_PASSWORD');
     expect(message).toContain('SEED_UPSTREAM_SLUG');
     expect(message).not.toContain(shortPassword);

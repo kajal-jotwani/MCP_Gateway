@@ -4,6 +4,7 @@ import type { FormEvent, MouseEvent, ReactNode } from 'react';
 import { api, ApiError, useAction } from './api';
 import type { Member, Role } from './api';
 import { AuditPage } from './AuditPage';
+import { ChatPage } from './ChatPage';
 import { ConnectPage } from './ConnectPage';
 import { KeysPage } from './KeysPage';
 import { MembersPage } from './MembersPage';
@@ -19,6 +20,7 @@ interface Page {
 
 const PAGES: Page[] = [
   { path: '/servers', title: 'Servers', render: (member) => <ServersPage member={member} /> },
+  { path: '/chat', title: 'Chat', render: () => <ChatPage /> },
   { path: '/keys', title: 'API keys', render: (member) => <KeysPage member={member} /> },
   {
     path: '/members',

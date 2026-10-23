@@ -68,6 +68,14 @@ export interface AuditEntry {
   reason: string | null;
 }
 
+/** What /api/chat streams, one JSON object per line. */
+export type ChatEvent =
+  | { type: 'text'; delta: string }
+  | { type: 'tool_call'; id: string; name: string; server: string | null; input: unknown }
+  | { type: 'tool_result'; id: string; isError: boolean; preview: string }
+  | { type: 'error'; message: string }
+  | { type: 'done' };
+
 /** An error response from the gateway, with the message it chose to show. */
 export class ApiError extends Error {
   constructor(
@@ -78,15 +86,18 @@ export class ApiError extends Error {
   }
 }
 
+type Method = 'GET' | 'POST' | 'PATCH' | 'DELETE';
+
 /**
- * Calls the gateway's dashboard API with the session cookie and the header its CSRF check wants.
- * Throws ApiError with the gateway's message when the response is not 2xx.
+ * Sends a request to the gateway's dashboard API with the session cookie and the header its CSRF
+ * check wants. Throws ApiError with the gateway's message when the response is not 2xx.
  */
-export async function api<T>(
-  method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
+export async function apiResponse(
+  method: Method,
   path: string,
   body?: unknown,
-): Promise<T> {
+  signal?: AbortSignal,
+): Promise<Response> {
   const response = await fetch(`/api${path}`, {
     method,
     headers: {
@@ -94,12 +105,19 @@ export async function api<T>(
       ...(body !== undefined && { 'content-type': 'application/json' }),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
   });
-  if (response.status === 204) return undefined as T;
-  const payload = (await response.json().catch(() => ({}))) as { error?: string };
-  if (!response.ok)
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => ({}))) as { error?: string };
     throw new ApiError(response.status, payload.error ?? `Request failed (HTTP ${response.status}).`);
-  return payload as T;
+  }
+  return response;
+}
+
+/** Calls the dashboard API and returns its JSON body, or undefined for a 204. */
+export async function api<T>(method: Method, path: string, body?: unknown): Promise<T> {
+  const response = await apiResponse(method, path, body);
+  return response.status === 204 ? (undefined as T) : ((await response.json()) as T);
 }
 
 /**

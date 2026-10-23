@@ -13,6 +13,8 @@ export interface GatewayConfig {
   firstAdmin: { email: string; password: string };
   /** The upstream registered on first start (WooCommerce). */
   seedUpstream: { name: string; slug: string; url: string };
+  /** The chat agent's key for the Claude API. */
+  anthropicApiKey: string;
 }
 
 const httpUrl = z.url({ protocol: /^https?$/ });
@@ -32,6 +34,7 @@ const envSchema = z.object({
   SEED_UPSTREAM_NAME: z.string().min(1).max(100),
   SEED_UPSTREAM_SLUG: z.string().regex(SLUG_PATTERN, 'must be 2-16 characters of a-z, 0-9 and -'),
   SEED_UPSTREAM_URL: httpUrl,
+  ANTHROPIC_API_KEY: z.string().min(1),
 });
 
 /**
@@ -60,5 +63,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): GatewayConfig {
       slug: vars.SEED_UPSTREAM_SLUG,
       url: vars.SEED_UPSTREAM_URL,
     },
+    anthropicApiKey: vars.ANTHROPIC_API_KEY,
   };
 }

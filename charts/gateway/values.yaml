@@ -4,6 +4,8 @@ secrets:
   gateway: gateway-credentials
   # NOTES_TOKEN, the bearer token notes-mcp requires. Admins enter the same value in the dashboard.
   notes: notes-credentials
+  # ANTHROPIC_API_KEY, the chat agent's key for the Claude API.
+  llm: llm-credentials
 
 # Where people reach the dashboard and the MCP endpoint. Also the Ingress host and the base of
 # invite links.

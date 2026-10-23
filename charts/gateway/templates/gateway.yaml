@@ -37,6 +37,7 @@ spec:
             {{- include "gateway.secretEnv" (list .Values.secrets.gateway "PGPASSWORD" "POSTGRES_PASSWORD") | nindent 12 }}
             {{- include "gateway.secretEnv" (list .Values.secrets.gateway "BOOTSTRAP_ADMIN_EMAIL" "BOOTSTRAP_ADMIN_EMAIL") | nindent 12 }}
             {{- include "gateway.secretEnv" (list .Values.secrets.gateway "BOOTSTRAP_ADMIN_PASSWORD" "BOOTSTRAP_ADMIN_PASSWORD") | nindent 12 }}
+            {{- include "gateway.secretEnv" (list .Values.secrets.llm "ANTHROPIC_API_KEY" "ANTHROPIC_API_KEY") | nindent 12 }}
             - name: SEED_UPSTREAM_NAME
               value: {{ .Values.seedUpstream.name | quote }}
             - name: SEED_UPSTREAM_SLUG

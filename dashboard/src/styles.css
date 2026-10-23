@@ -268,3 +268,61 @@ summary {
   color: var(--muted);
   margin: 8px 0;
 }
+
+.badge.running {
+  color: var(--accent);
+}
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.bubble {
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  max-width: 85%;
+}
+
+.bubble.user {
+  align-self: flex-end;
+  background: var(--surface);
+  white-space: pre-wrap;
+}
+
+.bubble.assistant {
+  align-self: flex-start;
+  background: var(--surface);
+}
+
+.assistant-text {
+  white-space: pre-wrap;
+  margin: 4px 0;
+}
+
+.tool-call {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  margin: 8px 0;
+}
+
+.tool-call summary {
+  color: var(--text);
+}
+
+pre {
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 0.85em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--bg);
+  padding: 8px;
+  border-radius: 6px;
+  margin: 4px 0 8px;
+  max-height: 320px;
+  overflow: auto;
+}

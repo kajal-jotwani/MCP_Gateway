@@ -4,12 +4,14 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import Anthropic from '@anthropic-ai/sdk';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { createApiKey } from '../src/apiKeys.js';
 import { createApp } from '../src/app.js';
 import type { AuditEntry } from '../src/audit.js';
+import type { ChatEvent } from '../src/chat.js';
 import type { Database } from '../src/db.js';
 import { createGatewayMcpHandler } from '../src/mcpEndpoint.js';
 import { UpstreamRegistry } from '../src/registry.js';
@@ -17,7 +19,8 @@ import { createMember, ensureFirstAdmin, hashPassword, verifyPassword } from '..
 import type { Member, Role } from '../src/team.js';
 import { listUpstreamConfigs } from '../src/upstreams.js';
 import { createTestDatabase } from './database.js';
-import { onCleanup, runCleanups, startUpstream, text } from './fakeUpstreams.js';
+import { startFakeClaude } from './fakeClaude.js';
+import { eventually, onCleanup, runCleanups, startUpstream, text } from './fakeUpstreams.js';
 import type { FakeUpstream } from './fakeUpstreams.js';
 
 const ADMIN = { email: 'admin@example.com', password: 'admin-password-123' };
@@ -57,11 +60,17 @@ interface Gateway {
   upstream: FakeUpstream;
 }
 
+// For gateways whose test does not chat: any call to it fails to connect.
+const unusedAnthropic = new Anthropic({ apiKey: 'unused', baseURL: 'http://127.0.0.1:9', maxRetries: 0 });
+
 /**
  * Starts the gateway's HTTP app on a free port, with one upstream named WooCommerce. With the shared
  * database, the gateway starts out seeing only its own upstream row.
  */
-async function startGateway(database: Database = db): Promise<Gateway> {
+async function startGateway(
+  database: Database = db,
+  anthropic: Anthropic = unusedAnthropic,
+): Promise<Gateway> {
   const upstream = await startUpstream(['list_orders', 'fail', 'sleep']);
   upstreamCounter += 1;
   const [{ id }] = (await database.query<{ id: string }>(
@@ -75,6 +84,7 @@ async function startGateway(database: Database = db): Promise<Gateway> {
     db: database,
     registry,
     mcpHandler,
+    anthropic,
     publicUrl: new URL('http://app.localtest.me'),
     dashboardDir,
   });
@@ -102,15 +112,42 @@ class Browser {
     body?: unknown,
     headers: Record<string, string> = { 'x-requested-with': 'urumi-dashboard' },
   ): Promise<{ status: number; body: Record<string, unknown> }> {
+    const { status, text } = await this.requestText(method, path, body, headers);
+    return { status, body: text ? JSON.parse(text) : {} };
+  }
+
+  async requestText(
+    method: string,
+    path: string,
+    body?: unknown,
+    headers: Record<string, string> = { 'x-requested-with': 'urumi-dashboard' },
+    signal?: AbortSignal,
+  ): Promise<{ status: number; text: string }> {
     const response = await fetch(`${this.gateway.url}/api${path}`, {
       method,
       headers: { 'content-type': 'application/json', cookie: this.cookie, ...headers },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
     });
     const setCookie = response.headers.get('set-cookie');
     if (setCookie) this.cookie = setCookie.split(';')[0]!;
-    const responseText = await response.text();
-    return { status: response.status, body: responseText ? JSON.parse(responseText) : {} };
+    return { status: response.status, text: await response.text() };
+  }
+
+  /** Sends one chat message and returns the events the gateway streamed back. */
+  async chat(question: string, signal?: AbortSignal): Promise<ChatEvent[]> {
+    const { status, text } = await this.requestText(
+      'POST',
+      '/chat',
+      { messages: [{ role: 'user', text: question }] },
+      undefined,
+      signal,
+    );
+    expect(status).toBe(200);
+    return text
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as ChatEvent);
   }
 
   async login(email: string, password: string): Promise<this> {
@@ -605,6 +642,129 @@ describe('upstream servers', () => {
     expect((await add({ name: 'A', url: 'http://notes/mcp', auth: { type: 'bearer' } })).status).toBe(400);
     const [existing] = (await admin.request('GET', '/upstreams')).body.upstreams as { slug: string }[];
     expect((await add({ name: 'Copy', slug: existing!.slug, url: 'http://notes/mcp' })).status).toBe(409);
+  });
+});
+
+describe('chat agent', () => {
+  it('answers through Claude, calling gateway tools as the signed-in member and auditing them as chat', async () => {
+    const after = '2026-10-23T00:00:00';
+    const claude = await startFakeClaude([
+      {
+        blocks: [
+          { type: 'text', text: 'Checking the store.' },
+          { type: 'tool_use', name: 'list_orders', input: { after } },
+        ],
+        stopReason: 'tool_use',
+      },
+      { blocks: [{ type: 'text', text: 'One order came in today.' }], stopReason: 'end_turn' },
+    ]);
+    const gateway = await startGateway(db, claude.anthropic);
+    const member = await newMember();
+    const browser = await new Browser(gateway).login(member.email, PASSWORD);
+
+    const events = await browser.chat('Which orders came in today?');
+
+    expect(events).toEqual([
+      { type: 'text', delta: 'Checking the store.' },
+      { type: 'tool_call', id: 'toolu_1_1', name: 'list_orders', server: 'WooCommerce', input: { after } },
+      { type: 'tool_result', id: 'toolu_1_1', isError: false, preview: 'list_orders done' },
+      { type: 'text', delta: 'One order came in today.' },
+      { type: 'done' },
+    ]);
+    expect(gateway.upstream.calls).toEqual([
+      { tool: 'list_orders', args: { after }, authorization: undefined },
+    ]);
+    const [entry] = (await auditEntries(gateway)).filter((e) => e.memberId === member.id);
+    expect(entry).toMatchObject({ via: 'chat', keyPrefix: null, tool: 'list_orders', outcome: 'succeeded' });
+
+    const [first, second] = claude.requests;
+    expect(first?.body).toMatchObject({ model: 'claude-opus-5-5', fallbacks: 'default' });
+    expect(first?.betas).toContain('server-side-fallback-2026-07-01');
+    expect((first?.body.tools as { name: string }[]).map((tool) => tool.name)).toEqual([
+      'fail',
+      'list_orders',
+      'sleep',
+    ]);
+    const secondMessages = second?.body.messages as { role: string; content: unknown }[];
+    expect(secondMessages.at(-1)).toEqual({
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'toolu_1_1', content: 'list_orders done', is_error: false },
+      ],
+    });
+  });
+
+  it('returns a rejected tool call to Claude as an error result and audits it', async () => {
+    const claude = await startFakeClaude([
+      { blocks: [{ type: 'tool_use', name: 'delete_everything', input: {} }], stopReason: 'tool_use' },
+      { blocks: [{ type: 'text', text: 'That tool does not exist.' }], stopReason: 'end_turn' },
+    ]);
+    const gateway = await startGateway(db, claude.anthropic);
+    const member = await newMember();
+    const browser = await new Browser(gateway).login(member.email, PASSWORD);
+
+    const events = await browser.chat('Delete everything.');
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'tool_result',
+        isError: true,
+        preview: expect.stringMatching(/^Unknown tool/),
+      }),
+    );
+    const [entry] = (await auditEntries(gateway)).filter((e) => e.memberId === member.id);
+    expect(entry).toMatchObject({ via: 'chat', tool: 'delete_everything', outcome: 'rejected' });
+    expect(gateway.upstream.calls).toEqual([]);
+  });
+
+  it('cancels a running tool call when the browser disconnects', async () => {
+    const claude = await startFakeClaude([
+      { blocks: [{ type: 'tool_use', name: 'sleep', input: { ms: 2000 } }], stopReason: 'tool_use' },
+    ]);
+    const gateway = await startGateway(db, claude.anthropic);
+    const member = await newMember();
+    const browser = await new Browser(gateway).login(member.email, PASSWORD);
+
+    const disconnect = new AbortController();
+    setTimeout(() => disconnect.abort(), 100);
+    await expect(browser.chat('Wait a while.', disconnect.signal)).rejects.toThrow();
+
+    await eventually(async () => {
+      const [entry] = (await auditEntries(gateway)).filter((e) => e.memberId === member.id);
+      expect(entry).toMatchObject({
+        tool: 'sleep',
+        outcome: 'failed',
+        reason: 'The call was cancelled by the client.',
+      });
+    });
+    expect(claude.requests).toHaveLength(1);
+  });
+
+  it('reports a Claude API failure without internal details', async () => {
+    const claude = await startFakeClaude([]);
+    const gateway = await startGateway(db, claude.anthropic);
+    const browser = await new Browser(gateway).login((await newMember()).email, PASSWORD);
+
+    expect(await browser.chat('Hello')).toEqual([
+      { type: 'error', message: 'The Claude API returned an error (HTTP 500).' },
+    ]);
+  });
+
+  it('requires a signed-in member and a conversation that ends with the member', async () => {
+    const gateway = await startGateway();
+    const anonymous = await new Browser(gateway).requestText('POST', '/chat', {
+      messages: [{ role: 'user', text: 'Hello' }],
+    });
+    expect(anonymous.status).toBe(401);
+
+    const browser = await new Browser(gateway).login((await newMember()).email, PASSWORD);
+    const endsWithAssistant = await browser.request('POST', '/chat', {
+      messages: [
+        { role: 'user', text: 'Hello' },
+        { role: 'assistant', text: 'Hi' },
+      ],
+    });
+    expect(endsWithAssistant.status).toBe(400);
   });
 });
 

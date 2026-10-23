@@ -1,6 +1,8 @@
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+import Anthropic from '@anthropic-ai/sdk';
+
 import { createApp } from './app.js';
 import { loadConfig } from './config.js';
 import type { GatewayConfig } from './config.js';
@@ -43,7 +45,14 @@ if (await seedUpstreamOnce(db, config.seedUpstream)) {
 
 const registry = new UpstreamRegistry(TIMEOUTS);
 const mcpHandler = createGatewayMcpHandler({ db, registry });
-const app = createApp({ db, registry, mcpHandler, publicUrl: config.publicUrl, dashboardDir: DASHBOARD_DIR });
+const app = createApp({
+  db,
+  registry,
+  mcpHandler,
+  anthropic: new Anthropic({ apiKey: config.anthropicApiKey }),
+  publicUrl: config.publicUrl,
+  dashboardDir: DASHBOARD_DIR,
+});
 const server = app.listen(config.port, () => {
   console.log(JSON.stringify({ event: 'listening', port: config.port }));
 });
