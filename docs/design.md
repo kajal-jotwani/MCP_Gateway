@@ -266,7 +266,7 @@ Calls, listing, auth and audit would still be correct, because they read Postgre
 External client `tools/call`:
 
 1. Client POSTs to `https://app.<domain>/mcp` with `Authorization: Bearer urk_...`.
-2. Gateway hashes the key and loads the member. Unknown or revoked key: HTTP 401, audit entry `rejected` with the key's display prefix and no member.
+2. Gateway hashes the key and loads the member. Missing, unknown or revoked key, or a deactivated member's key: HTTP 401 and an audit entry `rejected` with the key's display prefix. A revoked key or a deactivated member's key matches a stored hash, so the entry is attributed to that member; an unknown key has no member.
 3. `authorizeToolCall`, then `routeToolCall` maps `list_orders` to the WooCommerce upstream and its original tool name.
 4. The registry's client for that upstream calls `list_orders` with the upstream's static credential, if any. The client's API key is not forwarded.
 5. woo-mcp signs a REST request to WordPress, trims the response and returns it.

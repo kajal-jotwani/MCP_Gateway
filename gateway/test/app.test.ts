@@ -435,10 +435,11 @@ describe('MCP endpoint with API keys', () => {
       (entry) => entry.keyPrefix === key.slice(4, 12) && entry.outcome === 'rejected',
     );
     expect(rejected).toMatchObject({
-      memberId: null,
+      memberId: member.id,
+      memberEmail: member.email,
       via: 'mcp',
       tool: 'list_orders',
-      reason: 'Unknown or revoked API key (tools/call).',
+      reason: 'Revoked API key (tools/call).',
     });
   });
 
@@ -448,10 +449,23 @@ describe('MCP endpoint with API keys', () => {
     const { key } = await createApiKey(db, { memberId: member.id, name: 'cli', createdBy: member.id });
     await (await adminBrowser(gateway)).request('PATCH', `/members/${member.id}`, { active: false });
 
+    const unknownKey = `urk_${'A'.repeat(43)}`;
     await expect(mcpClient(gateway, undefined)).rejects.toThrow(/401/);
-    await expect(mcpClient(gateway, `urk_${'A'.repeat(43)}`)).rejects.toThrow(/401/);
+    await expect(mcpClient(gateway, unknownKey)).rejects.toThrow(/401/);
     await expect(mcpClient(gateway, key)).rejects.toThrow(/401/);
     expect(gateway.upstream.calls).toEqual([]);
+
+    const entries = await auditEntries(gateway);
+    expect(entries.find((entry) => entry.keyPrefix === unknownKey.slice(4, 12))).toMatchObject({
+      memberId: null,
+      outcome: 'rejected',
+      reason: expect.stringMatching(/^Unknown API key \(/),
+    });
+    expect(entries.find((entry) => entry.keyPrefix === key.slice(4, 12))).toMatchObject({
+      memberId: member.id,
+      outcome: 'rejected',
+      reason: expect.stringMatching(/^API key of a deactivated member \(/),
+    });
   });
 
   it('audits failed, timed-out and unknown-tool calls with their reason', async () => {

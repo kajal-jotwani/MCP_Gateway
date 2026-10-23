@@ -23,6 +23,12 @@ export interface VerifiedKey {
   displayPrefix: string;
 }
 
+/** Why a presented key was refused. `memberId` is set when the key was issued to a member. */
+export interface RejectedKey {
+  rejected: 'unknown' | 'revoked' | 'member_deactivated';
+  memberId?: string;
+}
+
 const KEY_COLUMNS = `id, member_id AS "memberId", name, display_prefix AS "displayPrefix",
   created_by AS "createdBy", created_at AS "createdAt", revoked_at AS "revokedAt", last_used_at AS "lastUsedAt"`;
 
@@ -68,25 +74,29 @@ export async function revokeApiKey(db: Queryable, id: string): Promise<ApiKey | 
 }
 
 /**
- * Looks up the member a presented key belongs to. Undefined for a malformed, unknown or revoked key,
- * or one whose member is deactivated. There is no cache, so revocation applies to the next request.
+ * Looks up the member a presented key belongs to, or says why it is refused: malformed or unknown,
+ * revoked, or its member deactivated. There is no cache, so revocation applies to the next request.
  */
-export async function verifyApiKey(db: Queryable, key: string): Promise<VerifiedKey | undefined> {
+export async function verifyApiKey(db: Queryable, key: string): Promise<VerifiedKey | RejectedKey> {
   const displayPrefix = displayPrefixOf(key);
-  if (!displayPrefix) return undefined;
-  const [row] = await db.query<Member & { keyId: string }>(
-    `SELECT k.id AS "keyId", m.id, m.email, m.name, m.role, m.active
+  if (!displayPrefix) return { rejected: 'unknown' };
+  const [row] = await db.query<Member & { keyId: string; revoked: boolean }>(
+    `SELECT k.id AS "keyId", k.revoked_at IS NOT NULL AS revoked, m.id, m.email, m.name, m.role, m.active
      FROM api_keys k JOIN members m ON m.id = k.member_id
-     WHERE k.key_hash = $1 AND k.revoked_at IS NULL AND m.active`,
+     WHERE k.key_hash = $1`,
     [hashToken(key)],
   );
-  if (!row) return undefined;
+  if (!row) return { rejected: 'unknown' };
+  // A refused key that matches a stored hash was issued to this member, so its calls are audited
+  // under them.
+  if (row.revoked) return { rejected: 'revoked', memberId: row.id };
+  if (!row.active) return { rejected: 'member_deactivated', memberId: row.id };
   // Written at most once a minute per key, so busy clients do not turn every call into a write.
   await db.query(
     `UPDATE api_keys SET last_used_at = now()
      WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')`,
     [row.keyId],
   );
-  const { keyId, ...member } = row;
-  return { member, keyId, displayPrefix };
+  const { keyId, id, email, name, role, active } = row;
+  return { member: { id, email, name, role, active }, keyId, displayPrefix };
 }
