@@ -111,14 +111,18 @@ Why operator-created Secrets instead of Helm generating them with `randAlphaNum`
 
 Cursor's 60-character limit is the tightest of these.
 
-**Decision:** every exposed tool is named `<prefix>__<tool>`.
+**Decision:** tools keep their upstream names. A prefix is added only when two enabled upstreams expose the same name.
 
-- `prefix` belongs to the upstream record, not to the code. It defaults to a slug of the name the admin types (lowercase, `[a-z0-9-]`, 2–16 characters), the admin can override it, and it must be unique. No prefix is hard-coded anywhere, including for WooCommerce: the pre-registered store takes its name and prefix from gateway chart values (`store` by default). With the multi-store bonus, each store would register with its own name, so tool names say which store they act on.
-- The admin can change a prefix later. That renames the upstream's tools for every client, so the dashboard warns before saving, and the gateway sends `list_changed` the same way as for a disable.
-- `tool` is the upstream's name with any character outside `[A-Za-z0-9_-]` replaced by `_`.
-- Every tool is prefixed, not only colliding ones. Names stay stable when a new upstream with an overlapping tool name is added. `store__list_orders` and `notes__list_orders` can both exist.
-- Maximum exposed length is 48 characters. That leaves room for Cursor's 60 with a config key of up to 12 characters. A longer name is cut to 41 characters plus `_` plus the first 6 hex characters of the SHA-256 of the original name, so it stays unique and stable.
-- If two upstream tools on the same upstream map to the same exposed name after sanitizing, both get the hash suffix.
+- The exposed name is the upstream's tool name with any character outside `[A-Za-z0-9_-]` replaced by `_`. A server's `list_orders` reaches clients as `list_orders`.
+- Each upstream has a `slug` (lowercase `[a-z0-9-]`, 2–16 characters, unique). It defaults to a slug of the name the admin types and can be edited. Nothing in the code fixes a slug, including for WooCommerce, whose name and slug come from gateway chart values.
+- When two or more enabled upstreams expose the same name, every one of those colliding tools is renamed to `<slug>__<name>`, for example `store__search` and `notes__search`. Tools that do not collide keep their plain names. Renaming all sides, instead of letting the first-registered server keep the plain name, means the result does not depend on registration order, and the model is never handed one plain `search` that silently means one particular server.
+- Collisions are computed over every enabled upstream using its last known tool list, including upstreams that are currently Unreachable. So a pod dying (D8) does not rename the other server's tools back and forth.
+- Maximum exposed length is 48 characters. That leaves room for Cursor's 60 with a config key of up to 12 characters. A longer name is cut to 41 characters plus `_` plus the first 6 hex characters of the SHA-256 of the full name, so it stays unique and stable.
+- Any duplicate left after these steps (for example an upstream tool literally named `notes__search`, or two names that sanitize to the same string) gets the same hash suffix.
+
+Tradeoff: plain names are what clients and the model see most of the time, and they read naturally in prompts and in the chat UI. The cost is that adding an upstream with an overlapping name renames the existing tool for every client. The gateway sends `list_changed` when that happens, and the dashboard shows which tools are renamed and why, so the admin sees the effect before and after adding a server. The alternative, prefixing every tool always, keeps names stable but puts a server name on every tool, which Kajal chose against.
+
+Collisions are not part of the normal three-upstream setup. They are covered by unit tests and shown in the demo by registering a second copy of notes-mcp under another name: both `save_note` tools become `<slug>__save_note` and calls route to the right copy.
 
 **Mapping back:** the gateway never parses names to route. Each cache refresh builds a map from exposed name to `{upstreamId, originalName}`. `tools/call` looks the name up in that map, so the scheme can change without touching routing. The mapping function is pure and unit-tested (collisions, length, sanitizing, stability).
 
@@ -200,15 +204,15 @@ Alternative considered: the agent connects to the gateway's own `/mcp` with a ke
 
 ### Additional upstreams and the D5 prompt
 
-| Upstream | Prefix | Where | Credential |
-|---|---|---|---|
-| WooCommerce (`woo-mcp`) | `store` (from values) | namespace `store` | none at the MCP layer; NetworkPolicy restricts callers |
-| MCP reference server (`@modelcontextprotocol/server-everything`, Streamable HTTP mode) | `everything` | namespace `upstreams` | none |
-| `notes-mcp` (in repo): `save_note`, `list_notes`, `search_notes`, notes in memory | `notes` | namespace `upstreams` | bearer token from a Secret, entered by the admin in the dashboard (exercises G1 and G5) |
+| Upstream | Where | Credential |
+|---|---|---|
+| WooCommerce (`woo-mcp`) | namespace `store` | none at the MCP layer; NetworkPolicy restricts callers |
+| MCP reference server (`@modelcontextprotocol/server-everything`, Streamable HTTP mode) | namespace `upstreams` | none |
+| `notes-mcp` (in repo): `save_note`, `list_notes`, `search_notes`, notes in memory | namespace `upstreams` | bearer token from a Secret, entered by the admin in the dashboard (exercises G1 and G5) |
 
 `server-everything` is useful for failure tests because it has tools that sleep and that return errors. **To verify (stage 3):** its Streamable HTTP start command and tool names in the pinned version.
 
-D5 prompt: "Look up today's orders in the store and save a note called 'Orders today' that lists each order's number, customer and total." This needs `store__list_orders` and `notes__save_note`.
+D5 prompt: "Look up today's orders in the store and save a note called 'Orders today' that lists each order's number, customer and total." This needs `list_orders` from WooCommerce and `save_note` from notes-mcp.
 
 ### Gateway database
 
@@ -263,7 +267,7 @@ External client `tools/call`:
 
 1. Client POSTs to `https://app.<domain>/mcp` with `Authorization: Bearer urk_...`.
 2. Gateway hashes the key and loads the member. Unknown or revoked key: HTTP 401, audit entry `rejected` with the key's display prefix and no member.
-3. `authorizeToolCall`, then `routeToolCall` maps `store__list_orders` to the WooCommerce upstream and `list_orders`.
+3. `authorizeToolCall`, then `routeToolCall` maps `list_orders` to the WooCommerce upstream and its original tool name.
 4. The registry's client for that upstream calls `list_orders` with the upstream's static credential, if any. The client's API key is not forwarded.
 5. woo-mcp signs a REST request to WordPress, trims the response and returns it.
 6. Gateway returns the result unchanged except for size limits, and writes the audit entry (`succeeded`, duration).
@@ -277,13 +281,13 @@ members        id, email (unique), name, role (admin|member), password_hash, act
 sessions       id_hash, member_id, expires_at
 invites        token_hash, email, role, created_by, expires_at
 api_keys       id, member_id, key_hash (unique), display_prefix, name, created_by, created_at, revoked_at, last_used_at
-upstreams      id, prefix (unique), name, url, auth_type (none|bearer|header), auth_header_name, auth_secret, enabled, created_at, updated_at
-audit_entries  id, at, member_id (nullable), key_prefix (nullable), via (mcp|chat), upstream_id (nullable), upstream_prefix, tool, duration_ms, outcome (succeeded|failed|timed_out|rejected), reason
+upstreams      id, slug (unique), name, url, auth_type (none|bearer|header), auth_header_name, auth_secret, enabled, created_at, updated_at
+audit_entries  id, at, member_id (nullable), key_prefix (nullable), via (mcp|chat), upstream_id (nullable), upstream_name, tool, duration_ms, outcome (succeeded|failed|timed_out|rejected), reason
 ```
 
-`upstreams.auth_secret` is write-only through the API: responses say whether a credential is set, never what it is. Encrypting it at rest is a hardening extension. Audit entries copy `upstream_prefix` and `tool` as text so entries stay readable after an upstream is removed.
+`upstreams.auth_secret` is write-only through the API: responses say whether a credential is set, never what it is. Encrypting it at rest is a hardening extension. Audit entries copy `upstream_name` and the original `tool` name as text so entries stay readable after an upstream is removed.
 
-The WooCommerce upstream is inserted on the gateway's first start from chart values (name, prefix, URL of the woo-mcp Service) (G7). A one-row `bootstrap` table records that this happened, so an admin who later renames or removes it does not get it back on restart.
+The WooCommerce upstream is inserted on the gateway's first start from chart values (name, slug, URL of the woo-mcp Service) (G7). A one-row `bootstrap` table records that this happened, so an admin who later renames or removes it does not get it back on restart.
 
 ## Kubernetes topology
 
@@ -321,7 +325,7 @@ Image tags are pinned in `values.yaml`. Gateway, woo-mcp and notes-mcp images ar
 | W5 | REST v3 with OAuth 1.0a signing (this document) |
 | G1, G7 | Upstream CRUD API and dashboard; WooCommerce seeded from values on first start |
 | G2 | Aggregated `tools/list` from cache, map-based `tools/call` routing |
-| G3 | `<prefix>__<tool>` with a per-upstream prefix, 48-character cap with hash suffix |
+| G3 | Plain tool names; `<slug>__<tool>` only for colliding names, 48-character cap with hash suffix |
 | G4 | Parallel refresh with per-upstream timeouts, 30 s call timeout, Unreachable tools hidden |
 | G6 | WooCommerce, server-everything, notes-mcp |
 | T1, T3 | `members.role`, invite links |
