@@ -186,6 +186,12 @@ describe('woo-mcp tools', () => {
     expect(JSON.parse(resultText(result))).toMatchObject({ id: 7, permalink: product.permalink });
   });
 
+  it('accepts a numeric price and sends it to WooCommerce as a string', async () => {
+    respond = (_request, res) => json(res, 201, product);
+    await client.callTool({ name: 'create_product', arguments: { name: 'Mug', regular_price: 19.5 } });
+    expect(JSON.parse(requests[0]?.body ?? '')).toMatchObject({ regular_price: '19.5' });
+  });
+
   it('updates an order status with PUT', async () => {
     respond = (_request, res) => json(res, 200, { ...order, status: 'completed' });
     const result = await client.callTool({

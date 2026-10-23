@@ -109,10 +109,13 @@ export function createWooServer(store: StoreClient, storeTimezone: string): McpS
         'Create a simple product in the WooCommerce store. It is published unless status is draft.',
       inputSchema: z.object({
         name: z.string().min(1).max(200),
+        // Clients send prices both as numbers and as strings; WooCommerce wants a string.
         regular_price: z
-          .string()
-          .regex(/^\d+(\.\d{1,2})?$/, 'must be a decimal number such as 19.99')
-          .describe('Price in the store currency, as a string such as "19.99"'),
+          .union([
+            z.number().nonnegative(),
+            z.string().regex(/^\d+(\.\d{1,2})?$/, 'must be a decimal number such as 19.99'),
+          ])
+          .describe('Price in the store currency, such as 19.99'),
         description: z.string().max(5000).optional(),
         status: z.enum(['publish', 'draft']).default('publish'),
       }),
@@ -122,7 +125,7 @@ export function createWooServer(store: StoreClient, storeTimezone: string): McpS
       const response = await store({
         method: 'POST',
         path: 'products',
-        body: { name, type: 'simple', regular_price, description, status },
+        body: { name, type: 'simple', regular_price: String(regular_price), description, status },
         signal: ctx.mcpReq.signal,
       });
       return textResult(parseStoreBody(wooProduct, response.body));
