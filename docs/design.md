@@ -1,6 +1,6 @@
 # Design
 
-Status: draft for review. Nothing is implemented yet. Statements marked **Verified** were checked against docs or package contents on 2026-10-23. Statements marked **To verify** are assumptions that get checked in the stage named next to them.
+Status: approved on 2026-10-23 and implemented. Statements marked **Verified** were checked against docs, package contents or the running system, with the build stage named where it matters. Statements marked **To verify** still need a check outside the build sandbox, on a Mac or on the VPS.
 
 ## Components
 
@@ -12,14 +12,14 @@ Status: draft for review. Nothing is implemented yet. Statements marked **Verifi
 | `woo-mcp` | Deployment, ClusterIP Service, namespace `store` | MCP server written here. Five tools over the WooCommerce REST API |
 | `gateway` | Deployment (1 replica), namespace `gateway` | MCP endpoint for clients, MCP client to every upstream, auth, audit, chat agent, dashboard API, serves the built dashboard |
 | PostgreSQL | StatefulSet, PVC, namespace `gateway` | Members, sessions, invites, API keys, upstreams, audit entries |
-| `server-everything` | Deployment, namespace `upstreams` | Second upstream: the official MCP reference server |
-| `notes-mcp` | Deployment, namespace `upstreams` | Third upstream, written here: a small notes server that requires a bearer token |
+| `server-everything` | Deployment, ClusterIP Service, namespace `gateway` | Second upstream: the official MCP reference server |
+| `notes-mcp` | Deployment, ClusterIP Service, namespace `gateway` | Third upstream, written here: a small notes server that requires a bearer token |
 
 The dashboard (`dashboard/`, React + Vite) is built into the gateway image and served by the gateway from the same origin as `/api` and `/mcp`. One origin means no CORS and one Ingress host.
 
-Stack: TypeScript on Node 24 LTS, Express 5, the MCP TypeScript SDK v2 (`@modelcontextprotocol/server`, `@modelcontextprotocol/client`, `@modelcontextprotocol/express`, all 2.x), `pg` with plain SQL migrations, Vitest, ESLint and Prettier.
+Stack: TypeScript on Node 24 LTS, Express 5, the MCP TypeScript SDK v2 (`@modelcontextprotocol/server` and `@modelcontextprotocol/client` 2.4, plus `@modelcontextprotocol/node` to mount the handler in Express), `pg` with plain SQL migrations, the Claude TypeScript SDK (`@anthropic-ai/sdk` 1.2), React 19 and Vite for the dashboard, Vitest with PGlite standing in for PostgreSQL in tests, ESLint and Prettier. All versions are pinned.
 
-**Verified:** SDK v2 is the current stable line and implements the 2026-07-28 spec. It also serves 2025-era clients (`initialize` handshake) statelessly by default (`createMcpHandler`, `legacy: 'stateless'`). SDK v1 (`@modelcontextprotocol/sdk` 1.32.x) is the maintenance line and stops at 2025-11-25. Using v2 lets the gateway talk to both new and older clients and upstreams.
+**Verified:** SDK v2 is the current stable line and implements the 2026-07-28 spec. It also serves 2025-era clients (`initialize` handshake) statelessly by default (`createMcpHandler`, whose default for legacy clients is stateless). SDK v1 (`@modelcontextprotocol/sdk` 1.32.x) is the maintenance line and stops at 2025-11-25. Using v2 lets the gateway talk to both new and older clients and upstreams.
 
 ### Repository layout
 
@@ -28,12 +28,13 @@ charts/store/      MariaDB, WordPress, setup Job, woo-mcp
 charts/gateway/    gateway, PostgreSQL, the two extra upstreams
 woo-mcp/           WooCommerce MCP server
 notes-mcp/         notes MCP server (third upstream)
+everything/        image for the MCP reference server (second upstream)
 gateway/           backend: MCP endpoint, upstream client, auth, audit, chat agent
 dashboard/         React frontend
 docs/              design.md, threat-model.md
 ```
 
-`notes-mcp/` is an addition to the layout in CLAUDE.md, needed for G6.
+`notes-mcp/` and `everything/` are additions to the layout in CLAUDE.md, needed for G6.
 
 Two charts instead of one: the store chart is the unit that the multi-store bonus would install per store, and the gateway does not need to be reinstalled when a store changes. Each chart has `values.yaml`, `values-local.yaml` and `values-prod.yaml`.
 
@@ -49,19 +50,19 @@ Two charts instead of one: the store chart is the unit that the multi-store bonu
 
 **Decision: REST API v3** over the in-cluster Service `http://wordpress.store.svc.cluster.local`.
 
-WooCommerce accepts HTTP Basic auth with a consumer key and secret only over HTTPS. Over plain HTTP it requires OAuth 1.0a one-legged signing. Traffic between pods is plain HTTP, so woo-mcp signs each request with OAuth 1.0a (HMAC-SHA256, Node `crypto`, about 40 lines, unit-tested against WooCommerce's documented example). The alternative, faking `is_ssl()` with a mu-plugin, changes WordPress behavior for every request and is harder to defend. **To verify (stage 2):** signing works against the pinned WooCommerce version.
+WooCommerce accepts HTTP Basic auth with a consumer key and secret only over HTTPS. Over plain HTTP it requires OAuth 1.0a one-legged signing. Traffic between pods is plain HTTP, so woo-mcp signs each request with OAuth 1.0a (HMAC-SHA256, Node `crypto`, about 40 lines, unit-tested). The alternative, faking `is_ssl()` with a mu-plugin, changes WordPress behavior for every request and is harder to defend. **Verified (stage 2):** the signature matches the verification in WooCommerce 11.2.1's PHP code, and all five tools work against the running store.
 
 Tools (W3), each with a JSON Schema for input and validation at the boundary:
 
 | Tool | REST call |
 |---|---|
-| `list_products` | `GET /products` (search, status, page, per_page ≤ 50) |
+| `list_products` | `GET /products` (search, status, page, per_page ≤ 50, default 20) |
 | `create_product` | `POST /products` (name, regular_price, optional description, status defaults to `publish`) |
 | `list_orders` | `GET /orders` (after, before, status, page, per_page ≤ 50) |
 | `get_order` | `GET /orders/{id}` |
 | `update_order_status` | `PUT /orders/{id}` with `status` from WooCommerce's fixed list |
 
-`list_orders` takes ISO dates and its description tells the model the store's timezone, so "orders that came in today" maps to an `after` value the model can compute. Results are trimmed to the fields a person needs (id, status, total, currency, date, customer name, line items), which keeps the LLM context small and leaves out customer addresses and emails.
+`list_orders` takes local date-times (`2026-10-24T00:00:00`) and its description tells the model the store's timezone, so "orders that came in today" maps to an `after` value the model can compute; the chat agent also gives the model the current time. Results are trimmed to the fields a person needs (id, number, status, total, currency, date, customer name, payment method, line items), which keeps the LLM context small and leaves out customer addresses and emails. Store responses are validated against a schema, so a changed store API gives a clear error instead of a garbled result.
 
 ### First deploy: a working store without manual steps
 
@@ -73,13 +74,13 @@ Tools (W3), each with a JSON Schema for input and validation at the boundary:
 
 **Decision: post-install and post-upgrade hook Job** that waits for the database, then runs:
 
-1. `wp core install` if not installed (site URL from values, admin user from the Secret).
-2. `wp plugin install woocommerce --version=<pinned> --activate` if missing.
-3. Store settings: currency, country, timezone, a `Shop` page; enable the COD gateway (`wp wc payment_gateway update cod --enabled=true`).
-4. Insert the REST key from the Secret into `wp_woocommerce_api_keys` with `wp eval` (stored the way WooCommerce stores it: `wc_api_hash(consumer_key)`, the secret, and the last 7 characters) if a key with that hash does not exist. Read/write permission.
-5. Create two sample products if the store has none.
+1. `wp core install` if not installed (site URL from values, admin password from the Secret).
+2. `wp plugin install woocommerce --version=<pinned>` if the installed version differs, then activate it and run its database update.
+3. Store settings: timezone, pretty permalinks, the WooCommerce pages, currency, country, no "coming soon" mode, no shipping; enable the COD gateway (`wp wc payment_gateway update cod --enabled=true`).
+4. Store the REST key from the Secret in `wp_woocommerce_api_keys` with `wp eval-file` (stored the way WooCommerce stores keys: `wc_api_hash(consumer_key)`, the secret, and the last 7 characters), inserting or updating the row the chart owns. Read/write permission, acting as the admin.
+5. Create two sample products on the first run only.
 
-Every step checks before acting, so the Job can run on every upgrade. Exact WordPress image tag, WooCommerce version and the `wp wc` command syntax are **To verify (stage 1)**.
+Every step checks before acting, so the Job runs on every install and upgrade. **Verified (stage 1):** WordPress image `wordpress:7.1.3-php8.4-apache`, WP-CLI `wordpress:cli-2.12.0-php8.4`, WooCommerce 11.2.1; repeated upgrades rerun the Job cleanly. **To verify:** the plugin download from wordpress.org, which is blocked in the build sandbox (the plugin was copied into the volume by hand there).
 
 **How credentials reach woo-mcp:** the operator creates one Secret, `store-credentials`, before install (commands in the README, values from `openssl rand`): DB passwords, WordPress admin password, `WC_CONSUMER_KEY` (`ck_` + 40 hex) and `WC_CONSUMER_SECRET` (`cs_` + 40 hex). MariaDB, WordPress, the setup Job and woo-mcp all reference keys from that Secret through `secretKeyRef`. Because the key is generated before WooCommerce exists and inserted by the Job, no one has to copy a key out of wp-admin. Charts take the Secret name as a value and never contain secret values.
 
@@ -95,7 +96,7 @@ Why operator-created Secrets instead of Helm generating them with `randAlphaNum`
 **Decision: one long-lived client per enabled upstream,** owned by an upstream registry in the gateway process.
 
 - On start, and when an admin adds, edits or enables an upstream, the registry connects (SDK negotiates the protocol era) and lists tools.
-- Every 15 s a refresh loop lists tools on every enabled upstream in parallel, each with a 5 s timeout. Success sets **Connected** and replaces the cached tool list. Failure sets **Unreachable**, records the reason (timeout, connection refused, HTTP status, protocol error), and drops a broken client so the next refresh reconnects.
+- Every 15 s a refresh loop lists tools on every enabled upstream in parallel, each with a 5 s timeout (and 5 s to connect). Success sets **Connected** and replaces the cached tool list. Failure sets **Unreachable**, records the reason (timeout, connection refused, HTTP status, protocol error), and drops a broken client so the next refresh reconnects.
 - A tool call that fails at the transport level marks that upstream Unreachable immediately, so the dashboard updates without waiting for the next refresh (D8).
 - **Disabled** comes from the database. A disabled upstream has no client and no tools.
 - If an upstream advertises `tools.listChanged`, the registry also re-lists on that notification.
@@ -107,9 +108,9 @@ Why operator-created Secrets instead of Helm generating them with `randAlphaNum`
 - MCP spec 2026-07-28: names SHOULD be 1–128 characters from `A-Z a-z 0-9 _ - .`. The spec says aggregators SHOULD disambiguate, for example with a server prefix, and that `serverInfo.name` is not unique enough to use.
 - Cursor: server config key plus tool name must be at most 60 characters, and dots are rejected (Cursor forum, staff replies).
 - Claude API: tool names must match `^[a-zA-Z0-9_-]{1,128}$` (Anthropic tool-use docs). This applies to the chat agent and to Claude Code.
-- Claude Code exposes MCP tools to the model as `mcp__<server>__<tool>`. With the README telling users to name the server `urumi`, that adds 12 characters. **To verify (stage 3):** the exact Claude Code prefix format with the current version.
+- Claude Code exposes MCP tools to the model as `mcp__<server>__<tool>` (**Verified** from the Claude Code MCP docs, which give that form for hook matchers). The README and the dashboard name the server `team-gateway`, which adds 19 characters, well inside 128.
 
-Cursor's 60-character limit is the tightest of these.
+Cursor's 60-character limit is the tightest of these. `team-gateway` is 12 characters, so 48-character tool names fit it exactly.
 
 **Decision:** tools keep their upstream names. A prefix is added only when two enabled upstreams expose the same name.
 
@@ -118,11 +119,11 @@ Cursor's 60-character limit is the tightest of these.
 - When two or more enabled upstreams expose the same name, every one of those colliding tools is renamed to `<slug>__<name>`, for example `store__search` and `notes__search`. Tools that do not collide keep their plain names. Renaming all sides, instead of letting the first-registered server keep the plain name, means the result does not depend on registration order, and the model is never handed one plain `search` that silently means one particular server.
 - Collisions are computed over every enabled upstream using its last known tool list, including upstreams that are currently Unreachable. So a pod dying (D8) does not rename the other server's tools back and forth.
 - Maximum exposed length is 48 characters. That leaves room for Cursor's 60 with a config key of up to 12 characters. A longer name is cut to 41 characters plus `_` plus the first 6 hex characters of the SHA-256 of the full name, so it stays unique and stable.
-- Any duplicate left after these steps (for example an upstream tool literally named `notes__search`, or two names that sanitize to the same string) gets the same hash suffix.
+- Any duplicate left after these steps (for example an upstream tool literally named `notes__search`, or two names that sanitize to the same string) gets the same hash suffix. A name that is still ambiguous after that is left out, so a call can never reach the wrong upstream.
 
 Tradeoff: plain names are what clients and the model see most of the time, and they read naturally in prompts and in the chat UI. The cost is that adding an upstream with an overlapping name renames the existing tool for every client. The gateway sends `list_changed` when that happens, and the dashboard shows which tools are renamed and why, so the admin sees the effect before and after adding a server. The alternative, prefixing every tool always, keeps names stable but puts a server name on every tool, which Kajal chose against.
 
-Collisions are not part of the normal three-upstream setup. They are covered by unit tests and shown in the demo by registering a second copy of notes-mcp under another name: both `save_note` tools become `<slug>__save_note` and calls route to the right copy.
+Collisions are not part of the normal three-upstream setup. They are covered by unit tests and can be shown by registering notes-mcp a second time under another slug (README): all three notes tools become `<slug>__<tool>` on both entries, and the dashboard explains each rename.
 
 **Mapping back:** the gateway never parses names to route. Each cache refresh builds a map from exposed name to `{upstreamId, originalName}`. `tools/call` looks the name up in that map, so the scheme can change without touching routing. The mapping function is pure and unit-tested (collisions, length, sanitizing, stability).
 
@@ -136,7 +137,7 @@ On top of that:
 - **2025-era clients** are served statelessly, which means no standalone GET stream (**Verified:** the SDK returns 405 for legacy GET in this mode). They see the change on their next `tools/list`, for example a reconnect in Claude Code or "List Tools" in MCP Inspector.
 - **Chat agent:** lists tools at the start of every turn, so a disabled upstream's tools are gone from the next message.
 
-**Decision: both** push (for clients that subscribe) and per-request listing (for everyone). Keeping sessionful legacy support just for GET streams would make the gateway stateful for one feature. **To verify (stage 3):** which protocol era Claude Code, Cursor and MCP Inspector 2.x speak, and how each reacts.
+**Decision: both** push (for clients that subscribe) and per-request listing (for everyone). Keeping sessionful legacy support just for GET streams would make the gateway stateful for one feature. **Verified:** MCP Inspector CLI 2.12 speaks the 2025 protocol (`initialize`) and sees a disabled server's tools disappear on its next `tools/list` (stage 7 acceptance run); a 2026-era SDK client receives `list_changed` (gateway tests). **To verify:** which era Claude Code and Cursor speak, and whether they re-list on their own or need a reconnect.
 
 ### Timeouts, fan-out and caching
 
@@ -148,7 +149,7 @@ On top of that:
 | Client `tools/list` at the gateway | No upstream call | Served from cache, so a dead upstream cannot slow it |
 | WooCommerce REST call inside woo-mcp | 20 s | Under the gateway's 30 s so woo-mcp can return a clear error first |
 
-A timed-out call is cancelled (the SDK aborts the request) and returns an MCP tool error: `Upstream "notes" did not respond within 30 s.` Unreachable upstreams return `Upstream "notes" is unreachable.` Neither message includes URLs or credentials.
+A timed-out call is cancelled (the SDK aborts the request) and returns an MCP tool error: `Upstream "Notes" did not respond within 30 s.` Unreachable upstreams return `Upstream "Notes" is unreachable.` Neither message includes URLs or credentials. Upstream results over 1 MB are replaced by an error, and the chat agent passes Claude at most 50,000 characters of one result.
 
 Cache invalidation: the per-upstream tool cache is replaced on every successful refresh, on admin edits, and on upstream `list_changed`. It is dropped when the upstream is disabled or removed. Tools from an Unreachable upstream are hidden from `tools/list`, because listing tools that will fail wastes the model's turns.
 
@@ -158,10 +159,10 @@ Cache invalidation: the per-upstream tool cache is replaced on every successful 
 
 - Passwords hashed with `crypto.scrypt` (Node built-in, N=2^15, r=8, p=1), so no native dependency.
 - Login sets an `HttpOnly`, `SameSite=Lax` cookie holding a random session id. Sessions live in PostgreSQL with a 7-day expiry and are deleted on logout.
-- State-changing dashboard requests require the cookie plus a custom header (`X-Requested-With`), which a cross-site form cannot send.
-- The first admin is created at gateway start if no members exist, from the `gateway-bootstrap` Secret (email, password).
+- Every dashboard API request other than a GET must carry the header `X-Requested-With: urumi-dashboard`, which a cross-site form cannot send.
+- The first admin is created at gateway start if no members exist, from `BOOTSTRAP_ADMIN_EMAIL` and `BOOTSTRAP_ADMIN_PASSWORD` in the `gateway-credentials` Secret.
 
-Invites without email: an admin enters an email and role, the gateway creates a one-time token (32 random bytes, stored as SHA-256, expires in 72 h) and shows a link `https://<dashboard>/invite/<token>` once. The admin sends the link any way they like. Opening it lets the invitee set a name and password. The token is deleted on use.
+Invites without email: an admin enters an email and role, the gateway creates a one-time token (32 random bytes, stored as SHA-256, expires in 72 h) and shows a link `https://<dashboard>/invite#<token>` once. The token is in the URL fragment, which browsers never send to a server, so it stays out of access logs; the dashboard posts it in a request body. The admin sends the link any way they like. Opening it lets the invitee set a name and password. The token is deleted on use.
 
 Alternatives considered: OAuth/OIDC login (needs an identity provider for a local demo; listed as a later extension), magic links (need email).
 
@@ -173,32 +174,32 @@ Storage: SHA-256 of the full key, with a unique index. Verification hashes the p
 
 Why a fast hash: password hashes (scrypt, argon2) exist to slow down guessing of low-entropy secrets. A key with 256 bits of randomness cannot be guessed whatever the hash speed, so a slow hash would only add tens of milliseconds and CPU to every MCP request. SHA-256 also allows lookup by hash, so there is no per-key comparison loop and no timing signal on the secret.
 
-Keys are shown once on creation. Members create and revoke their own keys. Admins can create a key for a member (shown once to the admin) and revoke any key.
+Keys are shown once on creation. Members create and revoke their own keys. Admins can create a key for a member (shown once to the admin) and revoke any key. A call with a revoked key, or with a deactivated member's key, still matches a stored hash, so its rejection is audited under that member.
 
 ### Chat agent as the logged-in member
 
-The gateway has one function for each step every tool call goes through:
+`callTool` in `gateway/src/toolCalls.ts` runs each step every tool call goes through:
 
-1. `authorizeToolCall(member, exposedName)`: member is active, role allows tool use.
-2. `routeToolCall(exposedName)`: map lookup to upstream and original name; rejects unknown and disabled.
-3. `callUpstreamTool(...)`: timeout and error mapping.
-4. `writeAuditEntry(...)`: always, in a `finally`, including rejections.
+1. `mayUseTools(member)`: the member is active and their role allows tool use.
+2. `registry.resolve(exposedName)`: map lookup to the upstream and original name; unknown and disabled tools are rejected.
+3. `registry.callTool(...)`: the upstream's credential, the timeout and error mapping.
+4. `writeAuditEntry(...)`: always, in a `finally`, including rejections and unexpected errors.
 
 The MCP endpoint resolves the member from the API key and calls this path. The chat endpoint (`POST /api/chat`) resolves the member from the session cookie and calls the same path with `via = chat`. There is no other code that calls upstreams.
 
-LLM: the Claude API through the official TypeScript SDK (`@anthropic-ai/sdk`, pinned). The model is a chart value, default `claude-opus-5-5`. The API key is the `ANTHROPIC_API_KEY` entry of the `llm-credentials` Secret (C3).
+LLM: the Claude API through the official TypeScript SDK (`@anthropic-ai/sdk` 1.2.0), model `claude-opus-5-5` (a constant in `gateway/src/chat.ts`). The API key is the `ANTHROPIC_API_KEY` entry of the `llm-credentials` Secret (C3).
 
 The chat loop is a manual loop over the Messages API rather than the SDK's tool runner, because every tool execution has to go through the gateway's own path and the loop is short enough to read in one screen:
 
-1. List tools for the member and convert each to a Claude tool (`name`, `description`, `input_schema`). Exposed names already match the Claude API's name rule.
-2. Call `messages.create` with the system prompt, the conversation, the tools, `tool_choice: auto`, adaptive thinking (Opus 5.5 does not allow thinking to be turned off) and `effort: low`, which is enough to pick among a few tools and keeps cost and latency down.
+1. List the gateway's tools once for the turn and convert each to a Claude tool (`name`, `description`, `input_schema`). Exposed names already match the Claude API's name rule. The list stays fixed for the turn, because changing tools mid-turn would invalidate the turn's thinking; a tool disabled meanwhile fails in `callTool` with a clear error.
+2. Stream a Messages API request with the system prompt, the conversation, the tools and `effort: medium`. Opus 5.5 always thinks, so no thinking setting is sent, and `tool_choice` is left at its default (`auto`). The current time goes in the last user message rather than the system prompt, so the system prompt and tools stay a cacheable prefix.
 3. If `stop_reason` is `refusal` or `max_tokens`, stop and show a clear message; tools from a cut-off turn are not run.
 4. Run every `tool_use` block in the response in parallel through the path above, then send all `tool_result` blocks back in one user message, with `is_error: true` for failed, timed-out or rejected calls.
 5. Repeat until `stop_reason` is `end_turn`, at most 8 rounds.
 
 The server-side refusal fallback (`fallbacks: "default"` with the `server-side-fallback-2026-07-01` beta) is enabled, so a rare policy decline is retried on another model inside the same call instead of failing the turn.
 
-The browser receives a server-sent event stream with the assistant text and each tool call (name, arguments, outcome, duration) as it happens, so the UI shows which tools ran (C1). The conversation is kept in the browser and sent with each message; the gateway stores only audit entries. The system prompt tells the model that tool descriptions and results are data from third-party servers and never instructions.
+`POST /api/chat` streams newline-delimited JSON events to the browser: assistant text as it arrives, and each tool call (name, server, arguments) and its result (error flag and the first 2,000 characters) as it happens, so the UI shows which tools ran (C1). The conversation is kept in the browser and sent with each message as text only, so no thinking block from an earlier request is replayed; the gateway stores only audit entries. Closing the page cancels the turn, including running tool calls. The system prompt tells the model that tool descriptions and results are data from third-party servers and never instructions, and that it changes things only when the member asked for the change.
 
 Alternative considered: the agent connects to the gateway's own `/mcp` with a key minted for the member. That proves the external path, but needs a hidden key per member and an HTTP hop for nothing. The shared function gives the same guarantee and is easier to test.
 
@@ -206,11 +207,11 @@ Alternative considered: the agent connects to the gateway's own `/mcp` with a ke
 
 | Upstream | Where | Credential |
 |---|---|---|
-| WooCommerce (`woo-mcp`) | namespace `store` | none at the MCP layer; NetworkPolicy restricts callers |
-| MCP reference server (`@modelcontextprotocol/server-everything`, Streamable HTTP mode) | namespace `upstreams` | none |
-| `notes-mcp` (in repo): `save_note`, `list_notes`, `search_notes`, notes in memory | namespace `upstreams` | bearer token from a Secret, entered by the admin in the dashboard (exercises G1 and G5) |
+| WooCommerce (`woo-mcp`) | namespace `store`, pre-registered | none at the MCP layer; NetworkPolicy restricts callers |
+| MCP reference server (`@modelcontextprotocol/server-everything` 2.0.0, Streamable HTTP mode on port 3001) | namespace `gateway`, added by an admin at `http://everything:3001/mcp` | none |
+| `notes-mcp` (in repo): `save_note`, `list_notes`, `search_notes`, notes in memory | namespace `gateway`, added by an admin at `http://notes-mcp:3000/mcp` | bearer token from the `notes-credentials` Secret, entered by the admin in the dashboard (exercises G1 and G5) |
 
-`server-everything` is useful for failure tests because it has tools that sleep and that return errors. **To verify (stage 3):** its Streamable HTTP start command and tool names in the pinned version.
+`server-everything` is useful for failure tests because it has tools that sleep and that return errors. **Verified (stage 3):** started with `node dist/index.js streamableHttp`, it serves 22 tools at `/mcp`, including `echo`, `get-sum` and `trigger-long-running-operation`.
 
 D5 prompt: "Look up today's orders in the store and save a note called 'Orders today' that lists each order's number, customer and total." This needs `list_orders` from WooCommerce and `save_note` from notes-mcp.
 
@@ -227,7 +228,7 @@ D5 prompt: "Look up today's orders in the store and save a note called 'Orders t
 
 **Decision: Traefik,** which ships with k3s and k3d, so local and VPS use the same controller and the same Ingress objects.
 
-Local hostnames: `store.localtest.me` and `app.localtest.me`. `localtest.me` and every subdomain resolve to 127.0.0.1 in public DNS, so browsers and CLI clients work without editing `/etc/hosts` (**To verify (stage 1):** resolution on Kajal's Mac; this container has no outside DNS). The k3d cluster maps host port 80 to its load balancer. Offline fallback, documented in the README: add both names to `/etc/hosts`.
+Local hostnames: `store.localtest.me` and `app.localtest.me`. `localtest.me` and every subdomain resolve to 127.0.0.1 in public DNS, so browsers and CLI clients work without editing `/etc/hosts` (**To verify:** resolution on a Mac; the build sandbox has no outside DNS and used `/etc/hosts`). The k3d cluster maps host port 80 to its load balancer. Offline fallback, documented in the README: add both names to `/etc/hosts`.
 
 `*.localhost` was rejected because some resolvers outside browsers do not resolve subdomains of `localhost`, which would break CLI MCP clients. `.local` was rejected because macOS sends it to mDNS.
 
@@ -249,7 +250,7 @@ Each chart has a default-deny ingress policy for its namespace, then allows (`ch
 
 Egress is not restricted: the gateway calls upstreams that admins add anywhere and the Claude API, and WordPress downloads plugins.
 
-W4 is demonstrated in two ways: there is no Ingress or NodePort for woo-mcp, and a test pod in another namespace (or a pod in the gateway's namespace that is not the gateway) cannot connect to woo-mcp, while the gateway's calls succeed. **Verified (stage 7)** on k3s v1.36.5: before the policies a pod in `default` reached every internal Service; after them it, a pod in `default` labeled `app.kubernetes.io/name=gateway`, and a non-gateway pod in `gateway` all time out on woo-mcp, WordPress, MariaDB, PostgreSQL, notes-mcp and server-everything. The storefront, wp-admin, the setup Job and all three upstreams kept working.
+W4 is demonstrated in two ways: there is no Ingress or NodePort for woo-mcp, and a test pod in another namespace (or a pod in the gateway's namespace that is not the gateway) cannot connect to woo-mcp, while the gateway's calls succeed (README, "Check that woo-mcp is internal"). **Verified (stage 7)** on k3s v1.36.5: before the policies a pod in `default` reached every internal Service; after them it, a pod in `default` labeled `app.kubernetes.io/name=gateway`, and a non-gateway pod in `gateway` cannot connect to woo-mcp, WordPress, MariaDB, PostgreSQL, notes-mcp or server-everything (kube-router rejects the connection). The storefront, wp-admin, the setup Job and all three upstreams kept working.
 
 ### Is the gateway's MCP endpoint stateful?
 
@@ -281,9 +282,10 @@ Chat: browser POSTs to `/api/chat` with the session cookie. The gateway runs the
 ```
 members        id, email (unique), name, role (admin|member), password_hash, active, created_at
 sessions       id_hash, member_id, expires_at
-invites        token_hash, email, role, created_by, expires_at
+invites        id, token_hash (unique), email, role, created_by, expires_at
 api_keys       id, member_id, key_hash (unique), display_prefix, name, created_by, created_at, revoked_at, last_used_at
 upstreams      id, slug (unique), name, url, auth_type (none|bearer|header), auth_header_name, auth_secret, enabled, created_at, updated_at
+bootstrap      action, done_at
 audit_entries  id, at, member_id (nullable), key_prefix (nullable), via (mcp|chat), upstream_id (nullable), upstream_name, tool, duration_ms, outcome (succeeded|failed|timed_out|rejected), reason
 ```
 
@@ -307,11 +309,12 @@ Every workload has requests and limits and readiness and liveness probes that ch
 | woo-mcp | `/healthz`: process up and config loaded (does not call the store, so a store restart does not cycle woo-mcp) | same |
 | gateway | `/readyz`: PostgreSQL query succeeds. Upstream health is not checked | `/healthz`: event loop responds |
 | PostgreSQL | `pg_isready` | `pg_isready` |
-| notes-mcp, server-everything | HTTP GET on their health or MCP path | TCP |
+| notes-mcp | `/healthz` | same |
+| server-everything | TCP 3001 (it has no health route, and `GET /mcp` without a session is a 400) | same |
 
 Every long-running container runs as a non-root user with all capabilities dropped and privilege escalation off (**Verified (stage 7)** from `/proc/1/status` in each pod: uid 33 WordPress, 999 MariaDB, 70 PostgreSQL, 1000 for the Node images, no effective capabilities). WordPress runs Apache as `www-data` on port 80; the pod sets the namespaced sysctl `net.ipv4.ip_unprivileged_port_start=0` so no root or `NET_BIND_SERVICE` is needed. The one exception is a short init container in the WordPress pod and the setup Job that runs as root with only `CHOWN`, to hand the freshly created volume roots to `www-data`: `local-path` volumes ignore `fsGroup`.
 
-Image tags are pinned in `values.yaml`. Gateway, woo-mcp and notes-mcp images are built locally and loaded with `k3d image import`; on the VPS they come from GHCR with a pinned tag.
+Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and everything images are built locally and loaded with `k3d image import`; on the VPS they come from GHCR with the same tags.
 
 ## Requirement to mechanism
 
@@ -352,6 +355,6 @@ Image tags are pinned in `values.yaml`. Gateway, woo-mcp and notes-mcp images ar
 
 - `helm upgrade --install <release> charts/<chart> -f charts/<chart>/values-<env>.yaml --rollback-on-failure --timeout 10m` (Helm 4; Helm 3 calls the flag `--atomic`). It rolls back automatically if new pods do not become ready. **Verified (stage 8):** an upgrade to a gateway image tag that does not exist failed after the timeout and Helm rolled back to the previous revision; the old pod kept serving throughout.
 - `helm rollback <release> <revision>` returns templates and image tags to an earlier revision.
-- PVCs carry `helm.sh/resource-policy: keep`, so an uninstall or a bad upgrade does not delete data.
-- Gateway migrations only add tables and columns (no renames or drops within a release), so the previous image still works against the migrated schema after a rollback.
+- Data survives an uninstall or a bad upgrade: the `wp-content` claim carries `helm.sh/resource-policy: keep`, and the MariaDB and PostgreSQL claims come from StatefulSet claim templates, which Helm does not delete.
+- Gateway migrations (`gateway/migrations/*.sql`) run at start in one transaction under an advisory lock. They may only add tables and columns (no renames or drops within a release), so the previous image still works against the migrated schema after a rollback.
 - WordPress and WooCommerce versions are pinned. Upgrading WooCommerce is a values change; its own database migrations run in the setup Job. WooCommerce schema changes are not reversible by Helm, so take a MariaDB dump (`mariadb-dump` via `kubectl exec`, documented in the README) before changing that version.
