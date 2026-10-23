@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "workspaces": [
-    "woo-mcp"
+    "woo-mcp",
+    "notes-mcp"
   ],
   "engines": {
     "node": ">=22.12"

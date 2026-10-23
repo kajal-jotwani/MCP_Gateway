@@ -1,0 +1,8 @@
+{
+  "name": "everything",
+  "private": true,
+  "description": "The MCP reference server, packaged as the second upstream",
+  "dependencies": {
+    "@modelcontextprotocol/server-everything": "2.0.0"
+  }
+}
