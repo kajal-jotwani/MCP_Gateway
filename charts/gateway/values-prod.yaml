@@ -1,0 +1,14 @@
+# VPS running k3s. Set the dashboard URL to a hostname whose DNS A record points to the VPS, for
+# example app.<your-domain> or, without a domain, app.<vps-ip>.sslip.io. The README has the steps.
+publicUrl: ''
+
+images:
+  # Built and pushed to GHCR as described in the README. The packages must be public, because the
+  # chart uses no image pull secret.
+  gateway: ghcr.io/kajal-jotwani/gateway:0.1.0
+  notesMcp: ghcr.io/kajal-jotwani/notes-mcp:0.1.0
+  everything: ghcr.io/kajal-jotwani/everything:2.0.0
+
+storage:
+  # The k3s default, as on k3d. Stated here so the production choice is visible.
+  className: local-path

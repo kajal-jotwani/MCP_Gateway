@@ -1,0 +1,23 @@
+# VPS running k3s. Set the storefront URL to a hostname whose DNS A record points to the VPS, for
+# example store.<your-domain> or, without a domain, store.<vps-ip>.sslip.io. The README has the steps.
+store:
+  url: ''
+
+images:
+  # Built and pushed to GHCR as described in the README. The packages must be public, because the
+  # chart uses no image pull secret.
+  wooMcp: ghcr.io/kajal-jotwani/woo-mcp:0.1.0
+
+storage:
+  # The k3s default, as on k3d. Stated here so the production choice is visible.
+  className: local-path
+
+# More headroom than a laptop needs: Apache runs several PHP workers under real traffic, and MariaDB
+# keeps more of the WooCommerce tables in its buffer pool.
+resources:
+  mariadb:
+    requests: { cpu: 100m, memory: 384Mi }
+    limits: { cpu: '1', memory: 1Gi }
+  wordpress:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: '1', memory: 1Gi }

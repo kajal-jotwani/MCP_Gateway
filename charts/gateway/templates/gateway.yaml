@@ -93,7 +93,7 @@ metadata:
 spec:
   ingressClassName: {{ .Values.ingress.className }}
   rules:
-    - host: {{ (urlParse .Values.publicUrl).hostname | quote }}
+    - host: {{ (urlParse (required "Set publicUrl to the public dashboard URL." .Values.publicUrl)).hostname | quote }}
       http:
         paths:
           - path: /

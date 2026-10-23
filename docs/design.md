@@ -337,18 +337,20 @@ Image tags are pinned in `values.yaml`. Gateway, woo-mcp and notes-mcp images ar
 
 ## Production changes
 
-`values-prod.yaml` changes only:
+`values-prod.yaml` in each chart changes only:
 
-- Hostnames: real domain names with DNS A records pointing to the VPS.
+- Hostnames: `store.url` and `publicUrl`, real names whose DNS A records point to the VPS (`sslip.io` names work without a domain). They are empty in the file until the VPS is known, and the charts refuse to render without them.
 - Ingress: same Traefik class; TLS with cert-manager and Let's Encrypt is an optional extension.
 - Storage class: k3s `local-path` (the default on both k3d and k3s; set explicitly so the choice is visible).
-- Images: GHCR repository and tag instead of locally imported images.
-- Resources: somewhat higher limits for WordPress and MariaDB.
+- Images: public GHCR packages (`ghcr.io/kajal-jotwani/...`, same tags) instead of locally imported images, so the charts need no image pull secret.
+- Resources: higher memory limits for WordPress and MariaDB (1 GiB each).
 - Secrets: created with the same `kubectl` commands on the VPS, with new random values.
+
+**Verified (stage 8)** on the test k3s with a fresh install of both charts from `values-prod.yaml` in new namespaces (hostnames and the namespace wiring set with `--set`, images loaded under their GHCR names): the setup Job completed, all three upstreams connected, and the two-user acceptance run D1 to D9 passed. The run on a real VPS is still to do.
 
 ## Upgrade and rollback
 
-- `helm upgrade --install <release> charts/<chart> -f values-<env>.yaml --atomic --timeout 10m`. `--atomic` rolls back automatically if new pods do not become ready.
+- `helm upgrade --install <release> charts/<chart> -f charts/<chart>/values-<env>.yaml --rollback-on-failure --timeout 10m` (Helm 4; Helm 3 calls the flag `--atomic`). It rolls back automatically if new pods do not become ready. **Verified (stage 8):** an upgrade to a gateway image tag that does not exist failed after the timeout and Helm rolled back to the previous revision; the old pod kept serving throughout.
 - `helm rollback <release> <revision>` returns templates and image tags to an earlier revision.
 - PVCs carry `helm.sh/resource-policy: keep`, so an uninstall or a bad upgrade does not delete data.
 - Gateway migrations only add tables and columns (no renames or drops within a release), so the previous image still works against the migrated schema after a rollback.
