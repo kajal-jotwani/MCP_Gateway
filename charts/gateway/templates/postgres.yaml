@@ -1,0 +1,97 @@
+{{- $component := dict "root" $ "name" "postgres" }}
+# Headless Service: it governs the StatefulSet and resolves to the database pod for the gateway.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "gateway.selectorLabels" $component | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gateway.selectorLabels" $component | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gateway.labels" $component | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      # The alpine image's postgres user is uid 70. The data directory is created inside the volume
+      # by the entrypoint, so it is owned by that user even on local-path volumes.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: {{ .Values.images.postgres }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: gateway
+            - name: POSTGRES_DB
+              value: gateway
+            {{- include "gateway.secretEnv" (list .Values.secrets.gateway "POSTGRES_PASSWORD" "POSTGRES_PASSWORD") | nindent 12 }}
+          securityContext:
+            {{- include "gateway.restrictedContainer" . | nindent 12 }}
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "gateway", "-d", "gateway"]
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gateway", "-d", "gateway"]
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gateway", "-d", "gateway"]
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.resources.postgres | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+            # Writable paths the read-only root filesystem lacks: the server socket and temp files.
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+  # StatefulSet claims are not deleted by `helm uninstall`, so members, keys and the audit log
+  # outlive the release.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.storage.className }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.postgresSize }}

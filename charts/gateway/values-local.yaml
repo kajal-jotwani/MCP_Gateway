@@ -1,0 +1,8 @@
+# Local k3d cluster. *.localtest.me resolves to 127.0.0.1, and k3d maps host port 80 to Traefik.
+publicUrl: http://app.localtest.me
+
+images:
+  # Built locally and loaded with `k3d image import`.
+  gateway: urumi/gateway:0.1.0
+  notesMcp: urumi/notes-mcp:0.1.0
+  everything: urumi/everything:2.0.0

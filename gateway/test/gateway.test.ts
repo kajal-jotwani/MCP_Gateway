@@ -1,111 +1,28 @@
-import { createServer } from 'node:http';
-import type { Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
-
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
-import type { CallToolResult } from '@modelcontextprotocol/client';
-import { toNodeHandler } from '@modelcontextprotocol/node';
-import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import type { McpHttpHandler } from '@modelcontextprotocol/server';
 import { afterEach, describe, expect, it } from 'vitest';
-import * as z from 'zod/v4';
 
-import { createGatewayMcpHandler } from '../src/mcpEndpoint.js';
+import type { Queryable } from '../src/db.js';
+import { callerAuthInfo, createGatewayMcpHandler } from '../src/mcpEndpoint.js';
 import { UpstreamRegistry } from '../src/registry.js';
 import type { UpstreamConfig } from '../src/registry.js';
-
-interface ReceivedCall {
-  tool: string;
-  args: unknown;
-  authorization: string | undefined;
-}
-
-interface FakeUpstream {
-  url: string;
-  port: number;
-  calls: ReceivedCall[];
-  close(): Promise<void>;
-}
+import {
+  deadUrl,
+  eventually,
+  onCleanup,
+  runCleanups,
+  startSilentServer,
+  startUpstream,
+  text,
+} from './fakeUpstreams.js';
 
 const TIMEOUTS = { connectMs: 500, listMs: 500, callMs: 500 };
+const MEMBER = { id: 'member-1', email: 'a@example.com', name: 'A', role: 'member' as const, active: true };
+// Audit entries are covered with a real database in app.test.ts; here they only need somewhere to go.
+const auditSink: Queryable = { query: async () => [] };
 const NOTES_TOKEN = 'notes-token-for-tests';
 
-const cleanups: (() => Promise<void>)[] = [];
-
-afterEach(async () => {
-  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
-});
-
-async function listen(server: Server, port = 0): Promise<number> {
-  await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
-  return (server.address() as AddressInfo).port;
-}
-
-async function closeServer(server: Server): Promise<void> {
-  server.closeAllConnections();
-  await new Promise((resolve) => server.close(resolve));
-}
-
-/**
- * An MCP server on a real port whose tools echo their name and arguments. `sleep` waits for args.ms,
- * `fail` throws. With a token, requests without `Authorization: Bearer <token>` get 401.
- */
-async function startUpstream(
-  toolNames: string[],
-  options: { token?: string; port?: number } = {},
-): Promise<FakeUpstream> {
-  const calls: ReceivedCall[] = [];
-  const handler: McpHttpHandler = createMcpHandler(() => {
-    const server = new McpServer({ name: 'fake', version: '1.0.0' });
-    for (const tool of toolNames) {
-      server.registerTool(
-        tool,
-        { description: `${tool} tool`, inputSchema: z.object({ ms: z.number().optional() }).loose() },
-        async (args, ctx): Promise<CallToolResult> => {
-          calls.push({ tool, args, authorization: ctx.http?.req?.headers.get('authorization') ?? undefined });
-          if (tool === 'fail') throw new Error('the upstream tool failed');
-          if (tool === 'sleep') await new Promise((resolve) => setTimeout(resolve, args.ms ?? 0));
-          return { content: [{ type: 'text', text: `${tool} done` }] };
-        },
-      );
-    }
-    return server;
-  });
-  const node = toNodeHandler(handler);
-  const server = createServer((req, res) => {
-    if (options.token && req.headers.authorization !== `Bearer ${options.token}`) {
-      res.writeHead(401).end();
-      return;
-    }
-    void node(req, res);
-  });
-  const port = await listen(server, options.port);
-  let closed = false;
-  const close = async (): Promise<void> => {
-    if (closed) return;
-    closed = true;
-    await handler.close();
-    await closeServer(server);
-  };
-  cleanups.push(close);
-  return { url: `http://127.0.0.1:${port}/mcp`, port, calls, close };
-}
-
-/** A server that accepts connections and never answers. */
-async function startSilentServer(): Promise<string> {
-  const server = createServer(() => {});
-  const port = await listen(server);
-  cleanups.push(() => closeServer(server));
-  return `http://127.0.0.1:${port}/mcp`;
-}
-
-/** A URL nothing listens on. */
-async function deadUrl(): Promise<string> {
-  const server = createServer();
-  const port = await listen(server);
-  await closeServer(server);
-  return `http://127.0.0.1:${port}/mcp`;
-}
+afterEach(runCleanups);
 
 function upstream(
   slug: string,
@@ -119,7 +36,8 @@ function upstream(
 function connectThrough(handler: McpHttpHandler, client: Client): Promise<void> {
   return client.connect(
     new StreamableHTTPClientTransport(new URL('http://gateway.test/mcp'), {
-      fetch: (url, init) => handler.fetch(new Request(url, init)),
+      fetch: (url, init) =>
+        handler.fetch(new Request(url, init), { authInfo: callerAuthInfo({ member: MEMBER, via: 'mcp' }) }),
     }),
   );
 }
@@ -132,7 +50,7 @@ async function startGateway(configs: UpstreamConfig[]): Promise<{
 }> {
   const registry = new UpstreamRegistry(TIMEOUTS);
   await registry.sync(configs);
-  const handler = createGatewayMcpHandler(registry);
+  const handler = createGatewayMcpHandler({ db: auditSink, registry });
   let changes = 0;
   const client = new Client(
     { name: 'test-client', version: '1.0.0' },
@@ -142,7 +60,7 @@ async function startGateway(configs: UpstreamConfig[]): Promise<{
     },
   );
   await connectThrough(handler, client);
-  cleanups.push(async () => {
+  onCleanup(async () => {
     await client.close();
     await handler.close();
     await registry.close();
@@ -153,24 +71,6 @@ async function startGateway(configs: UpstreamConfig[]): Promise<{
 async function toolNames(client: Client): Promise<string[]> {
   const { tools } = await client.listTools(undefined, { cacheMode: 'bypass' });
   return tools.map((tool) => tool.name);
-}
-
-function text(result: Awaited<ReturnType<Client['callTool']>>): string {
-  const [first] = result.content as { type: string; text: string }[];
-  return first?.text ?? '';
-}
-
-async function eventually(assertion: () => void | Promise<void>, timeoutMs = 3000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    try {
-      await assertion();
-      return;
-    } catch (error) {
-      if (Date.now() > deadline) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-  }
 }
 
 describe('gateway core', () => {
@@ -201,7 +101,7 @@ describe('gateway core', () => {
     const { handler } = await startGateway([upstream('woocommerce', 'WooCommerce', woo.url)]);
     const legacyClient = new Client({ name: 'legacy-client', version: '1.0.0' });
     await connectThrough(handler, legacyClient);
-    cleanups.push(() => legacyClient.close());
+    onCleanup(() => legacyClient.close());
 
     expect(legacyClient.getNegotiatedProtocolVersion()).toMatch(/^2025-/);
     expect(await toolNames(legacyClient)).toEqual(['list_orders']);

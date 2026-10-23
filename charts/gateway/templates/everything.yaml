@@ -1,0 +1,55 @@
+{{- $component := dict "root" $ "name" "everything" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: everything
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gateway.selectorLabels" $component | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gateway.labels" $component | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "gateway.nodePodSecurity" . | nindent 8 }}
+      containers:
+        - name: everything
+          image: {{ .Values.images.everything }}
+          ports:
+            - name: mcp
+              containerPort: 3001
+          securityContext:
+            {{- include "gateway.restrictedContainer" . | nindent 12 }}
+          # The reference server has no health route, and GET /mcp without a session is a 400, so
+          # the probes check that the HTTP server accepts connections.
+          readinessProbe:
+            tcpSocket:
+              port: mcp
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: mcp
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources.everything | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: everything
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "gateway.selectorLabels" $component | nindent 4 }}
+  ports:
+    - name: mcp
+      port: 3001
+      targetPort: mcp

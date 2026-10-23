@@ -1,0 +1,43 @@
+# Secrets created by the operator before install. Keys are listed in the README.
+secrets:
+  # POSTGRES_PASSWORD, BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_PASSWORD
+  gateway: gateway-credentials
+  # NOTES_TOKEN, the bearer token notes-mcp requires. Admins enter the same value in the dashboard.
+  notes: notes-credentials
+
+# Where people reach the dashboard and the MCP endpoint. Also the Ingress host and the base of
+# invite links.
+publicUrl: http://app.localtest.me
+
+# Registered on the gateway's first start only. Admins can edit or remove it afterwards.
+seedUpstream:
+  name: WooCommerce
+  slug: woocommerce
+  url: http://woo-mcp.store.svc.cluster.local:3000/mcp
+
+images:
+  gateway: urumi/gateway:0.1.0
+  postgres: postgres:18.6-alpine3.24
+  notesMcp: urumi/notes-mcp:0.1.0
+  everything: urumi/everything:2.0.0
+
+ingress:
+  className: traefik
+
+storage:
+  className: local-path
+  postgresSize: 1Gi
+
+resources:
+  gateway:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: '1', memory: 512Mi }
+  postgres:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: '1', memory: 512Mi }
+  notesMcp:
+    requests: { cpu: 25m, memory: 64Mi }
+    limits: { cpu: 250m, memory: 192Mi }
+  everything:
+    requests: { cpu: 25m, memory: 96Mi }
+    limits: { cpu: 250m, memory: 256Mi }

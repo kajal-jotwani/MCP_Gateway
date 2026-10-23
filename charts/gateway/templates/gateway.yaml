@@ -1,0 +1,104 @@
+{{- $component := dict "root" $ "name" "gateway" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+spec:
+  # One replica: upstream status, the tool cache and change notifications live in process memory.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gateway.selectorLabels" $component | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gateway.labels" $component | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "gateway.nodePodSecurity" . | nindent 8 }}
+      containers:
+        - name: gateway
+          image: {{ .Values.images.gateway }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PUBLIC_URL
+              value: {{ .Values.publicUrl | quote }}
+            - name: PGHOST
+              value: postgres
+            - name: PGUSER
+              value: gateway
+            - name: PGDATABASE
+              value: gateway
+            {{- include "gateway.secretEnv" (list .Values.secrets.gateway "PGPASSWORD" "POSTGRES_PASSWORD") | nindent 12 }}
+            {{- include "gateway.secretEnv" (list .Values.secrets.gateway "BOOTSTRAP_ADMIN_EMAIL" "BOOTSTRAP_ADMIN_EMAIL") | nindent 12 }}
+            {{- include "gateway.secretEnv" (list .Values.secrets.gateway "BOOTSTRAP_ADMIN_PASSWORD" "BOOTSTRAP_ADMIN_PASSWORD") | nindent 12 }}
+            - name: SEED_UPSTREAM_NAME
+              value: {{ .Values.seedUpstream.name | quote }}
+            - name: SEED_UPSTREAM_SLUG
+              value: {{ .Values.seedUpstream.slug | quote }}
+            - name: SEED_UPSTREAM_URL
+              value: {{ .Values.seedUpstream.url | quote }}
+          securityContext:
+            {{- include "gateway.restrictedContainer" . | nindent 12 }}
+          # The gateway waits up to a minute for PostgreSQL and runs migrations before it listens.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          # Readiness checks the database only. A dead upstream must not take the gateway out of
+          # its Service.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources.gateway | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "gateway.selectorLabels" $component | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# One host for the dashboard, /api and /mcp, so the browser needs no CORS.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gateway
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ (urlParse .Values.publicUrl).hostname | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  name: http

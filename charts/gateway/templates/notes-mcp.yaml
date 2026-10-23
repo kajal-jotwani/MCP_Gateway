@@ -1,0 +1,57 @@
+{{- $component := dict "root" $ "name" "notes-mcp" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notes-mcp
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gateway.selectorLabels" $component | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gateway.labels" $component | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "gateway.nodePodSecurity" . | nindent 8 }}
+      containers:
+        - name: notes-mcp
+          image: {{ .Values.images.notesMcp }}
+          ports:
+            - name: mcp
+              containerPort: 3000
+          env:
+            {{- include "gateway.secretEnv" (list .Values.secrets.notes "NOTES_TOKEN" "NOTES_TOKEN") | nindent 12 }}
+          securityContext:
+            {{- include "gateway.restrictedContainer" . | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: mcp
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: mcp
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources.notesMcp | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notes-mcp
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "gateway.selectorLabels" $component | nindent 4 }}
+  ports:
+    - name: mcp
+      port: 3000
+      targetPort: mcp
