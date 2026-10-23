@@ -1,0 +1,80 @@
+# Every pod in the namespace refuses incoming traffic unless a policy below allows it. Egress is
+# not restricted: WordPress and the setup Job download plugins, and woo-mcp only calls WordPress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  labels:
+    {{- include "store.labels" (dict "root" $ "name" "default-deny-ingress") | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+---
+# Only the gateway's pods call woo-mcp. Other pods in the gateway's namespace, and every other
+# namespace, are refused.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: woo-mcp
+  labels:
+    {{- include "store.labels" (dict "root" $ "name" "woo-mcp") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "store.selectorLabels" (dict "root" $ "name" "woo-mcp") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.gatewayNamespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+      ports:
+        - port: mcp
+---
+# Browsers reach WordPress through the Ingress controller; woo-mcp calls its REST API.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: wordpress
+  labels:
+    {{- include "store.labels" (dict "root" $ "name" "wordpress") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "store.selectorLabels" (dict "root" $ "name" "wordpress") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.ingress.controllerNamespace }}
+        - podSelector:
+            matchLabels:
+              {{- include "store.selectorLabels" (dict "root" $ "name" "woo-mcp") | nindent 14 }}
+      ports:
+        - port: http
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mariadb
+  labels:
+    {{- include "store.labels" (dict "root" $ "name" "mariadb") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "store.selectorLabels" (dict "root" $ "name" "mariadb") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "store.selectorLabels" (dict "root" $ "name" "wordpress") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "store.selectorLabels" (dict "root" $ "name" "store-setup") | nindent 14 }}
+      ports:
+        - port: mysql

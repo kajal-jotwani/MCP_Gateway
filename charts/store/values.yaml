@@ -22,6 +22,11 @@ images:
 
 ingress:
   className: traefik
+  # Where the controller's pods run. The NetworkPolicies let only this namespace reach WordPress.
+  controllerNamespace: kube-system
+
+# The namespace the gateway chart is installed in. Only its gateway pods may call woo-mcp.
+gatewayNamespace: gateway
 
 storage:
   className: local-path

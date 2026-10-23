@@ -25,6 +25,8 @@ images:
 
 ingress:
   className: traefik
+  # Where the controller's pods run. The NetworkPolicies let only this namespace reach the gateway.
+  controllerNamespace: kube-system
 
 storage:
   className: local-path

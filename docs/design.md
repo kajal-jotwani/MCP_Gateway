@@ -239,15 +239,17 @@ WordPress `siteurl` is `http://store.localtest.me`. Inside the pod that name res
 
 **Decision: k3d.** k3s includes an embedded network policy controller (kube-router) next to flannel, so NetworkPolicies are enforced locally and on the VPS with the same objects, and the local cluster matches the VPS distribution.
 
-Policies (default deny ingress per namespace, then allow):
+Each chart has a default-deny ingress policy for its namespace, then allows (`charts/*/templates/networkpolicies.yaml`):
 
-- `woo-mcp`: from pods labeled `app.kubernetes.io/name=gateway` in namespace `gateway` only, on its port.
-- `wordpress`: from the Ingress controller namespace and from `woo-mcp`.
+- `woo-mcp`: from pods labeled `app.kubernetes.io/name=gateway` in the namespace named by the store value `gatewayNamespace` (default `gateway`), on its port.
+- `wordpress`: from the Ingress controller's namespace (`ingress.controllerNamespace`, `kube-system` for the Traefik that k3s ships) and from `woo-mcp`.
 - `mariadb`: from `wordpress` and the setup Job.
-- `notes-mcp`, `server-everything`: from the gateway only.
-- `postgres`: from the gateway only.
+- `gateway`: from the Ingress controller's namespace.
+- `notes-mcp`, `server-everything`, `postgres`: from the gateway only.
 
-W4 is demonstrated in two ways: there is no Ingress or NodePort for woo-mcp, and `kubectl run` a test pod in another namespace and `curl` woo-mcp, which times out, while the gateway's call succeeds. **To verify (stage 2):** enforcement on the pinned k3d/k3s version with that test.
+Egress is not restricted: the gateway calls upstreams that admins add anywhere and the Claude API, and WordPress downloads plugins.
+
+W4 is demonstrated in two ways: there is no Ingress or NodePort for woo-mcp, and a test pod in another namespace (or a pod in the gateway's namespace that is not the gateway) cannot connect to woo-mcp, while the gateway's calls succeed. **Verified (stage 7)** on k3s v1.36.5: before the policies a pod in `default` reached every internal Service; after them it, a pod in `default` labeled `app.kubernetes.io/name=gateway`, and a non-gateway pod in `gateway` all time out on woo-mcp, WordPress, MariaDB, PostgreSQL, notes-mcp and server-everything. The storefront, wp-admin, the setup Job and all three upstreams kept working.
 
 ### Is the gateway's MCP endpoint stateful?
 
@@ -307,7 +309,7 @@ Every workload has requests and limits and readiness and liveness probes that ch
 | PostgreSQL | `pg_isready` | `pg_isready` |
 | notes-mcp, server-everything | HTTP GET on their health or MCP path | TCP |
 
-Containers run as non-root where the image allows it (all Node images, PostgreSQL, MariaDB). The official WordPress Apache image starts as root and drops to `www-data`; **To verify (stage 7):** whether it runs fully as non-root on port 8080 with a config change, otherwise document the exception.
+Every long-running container runs as a non-root user with all capabilities dropped and privilege escalation off (**Verified (stage 7)** from `/proc/1/status` in each pod: uid 33 WordPress, 999 MariaDB, 70 PostgreSQL, 1000 for the Node images, no effective capabilities). WordPress runs Apache as `www-data` on port 80; the pod sets the namespaced sysctl `net.ipv4.ip_unprivileged_port_start=0` so no root or `NET_BIND_SERVICE` is needed. The one exception is a short init container in the WordPress pod and the setup Job that runs as root with only `CHOWN`, to hand the freshly created volume roots to `www-data`: `local-path` volumes ignore `fsGroup`.
 
 Image tags are pinned in `values.yaml`. Gateway, woo-mcp and notes-mcp images are built locally and loaded with `k3d image import`; on the VPS they come from GHCR with a pinned tag.
 
