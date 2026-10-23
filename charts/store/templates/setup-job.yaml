@@ -1,0 +1,111 @@
+{{- $component := dict "root" $ "name" "store-setup" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: store-setup
+  labels:
+    {{- include "store.labels" $component | nindent 4 }}
+data:
+  setup.sh: |
+    {{- .Files.Get "files/setup.sh" | nindent 4 }}
+  rest-key.php: |
+    {{- .Files.Get "files/rest-key.php" | nindent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: store-setup
+  labels:
+    {{- include "store.labels" $component | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    # Keep the last run so its logs can be read; replace it on the next install or upgrade.
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        {{- include "store.labels" $component | nindent 8 }}
+      annotations:
+        checksum/scripts: {{ printf "%s%s" (.Files.Get "files/setup.sh") (.Files.Get "files/rest-key.php") | sha256sum }}
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        # The uid of www-data in the WordPress image, so files the Job writes to wp-content stay
+        # writable by WordPress. The WP-CLI image's own www-data is uid 82.
+        runAsUser: 33
+        runAsGroup: 33
+        fsGroup: 33
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        {{- include "store.volumeOwnerInit" (list . (dict "name" "wordpress" "path" "/var/www/html") (dict "name" "wp-content" "path" "/var/www/html/wp-content")) | nindent 8 }}
+        # WP-CLI needs the WordPress files and wp-config.php. The WordPress image's entrypoint copies
+        # them from the same image version the Deployment runs, into an emptyDir.
+        - name: wordpress-files
+          image: {{ .Values.images.wordpress }}
+          command: ["docker-ensure-installed.sh", "true"]
+          workingDir: /var/www/html
+          env:
+            {{- include "store.wordpressEnv" . | nindent 12 }}
+          securityContext:
+            {{- include "store.restrictedContainer" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources.setup | nindent 12 }}
+          volumeMounts:
+            - name: wordpress
+              mountPath: /var/www/html
+            - name: wp-content
+              mountPath: /var/www/html/wp-content
+      containers:
+        - name: setup
+          image: {{ .Values.images.wpCli }}
+          command: ["sh", "/scripts/setup.sh"]
+          env:
+            {{- include "store.wordpressEnv" . | nindent 12 }}
+            - name: HOME
+              value: /tmp
+            - name: STORE_URL
+              value: {{ .Values.store.url | quote }}
+            - name: STORE_TITLE
+              value: {{ .Values.store.title | quote }}
+            - name: STORE_TIMEZONE
+              value: {{ .Values.store.timezone | quote }}
+            - name: STORE_CURRENCY
+              value: {{ .Values.store.currency | quote }}
+            - name: STORE_COUNTRY
+              value: {{ .Values.store.country | quote }}
+            - name: WP_ADMIN_USER
+              value: {{ .Values.store.adminUser | quote }}
+            - name: WP_ADMIN_EMAIL
+              value: {{ .Values.store.adminEmail | quote }}
+            {{- include "store.secretEnv" (list . "WP_ADMIN_PASSWORD" "WORDPRESS_ADMIN_PASSWORD") | nindent 12 }}
+            - name: WOOCOMMERCE_VERSION
+              value: {{ .Values.woocommerceVersion | quote }}
+            {{- include "store.secretEnv" (list . "WC_CONSUMER_KEY" "WC_CONSUMER_KEY") | nindent 12 }}
+            {{- include "store.secretEnv" (list . "WC_CONSUMER_SECRET" "WC_CONSUMER_SECRET") | nindent 12 }}
+          securityContext:
+            {{- include "store.restrictedContainer" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources.setup | nindent 12 }}
+          volumeMounts:
+            - name: wordpress
+              mountPath: /var/www/html
+            - name: wp-content
+              mountPath: /var/www/html/wp-content
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: wordpress
+          emptyDir: {}
+        # ReadWriteOnce is per node. The local-path volume is pinned to one node, so this pod lands
+        # on the same node as WordPress.
+        - name: wp-content
+          persistentVolumeClaim:
+            claimName: wp-content
+        - name: scripts
+          configMap:
+            name: store-setup

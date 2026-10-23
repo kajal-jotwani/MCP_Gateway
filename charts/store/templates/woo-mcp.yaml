@@ -1,0 +1,72 @@
+{{- $component := dict "root" $ "name" "woo-mcp" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: woo-mcp
+  labels:
+    {{- include "store.labels" $component | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "store.selectorLabels" $component | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "store.labels" $component | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: woo-mcp
+          image: {{ .Values.images.wooMcp }}
+          ports:
+            - name: mcp
+              containerPort: 3000
+          env:
+            - name: WOO_API_URL
+              value: http://wordpress.{{ .Release.Namespace }}.svc.cluster.local
+            - name: WOO_SITE_URL
+              value: {{ .Values.store.url | quote }}
+            - name: STORE_TIMEZONE
+              value: {{ .Values.store.timezone | quote }}
+            {{- include "store.secretEnv" (list . "WC_CONSUMER_KEY" "WC_CONSUMER_KEY") | nindent 12 }}
+            {{- include "store.secretEnv" (list . "WC_CONSUMER_SECRET" "WC_CONSUMER_SECRET") | nindent 12 }}
+          securityContext:
+            {{- include "store.restrictedContainer" . | nindent 12 }}
+            readOnlyRootFilesystem: true
+          # /healthz does not call the store, so a store restart does not restart woo-mcp.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: mcp
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: mcp
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources.wooMcp | nindent 12 }}
+---
+# ClusterIP only, and no Ingress: woo-mcp is reachable inside the cluster and the NetworkPolicy
+# narrows that to the gateway.
+apiVersion: v1
+kind: Service
+metadata:
+  name: woo-mcp
+  labels:
+    {{- include "store.labels" $component | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "store.selectorLabels" $component | nindent 4 }}
+  ports:
+    - name: mcp
+      port: 3000
+      targetPort: mcp

@@ -1,0 +1,7 @@
+# Local k3d cluster. *.localtest.me resolves to 127.0.0.1, and k3d maps host port 80 to Traefik.
+store:
+  url: http://store.localtest.me
+
+images:
+  # Built locally and loaded with `k3d image import`.
+  wooMcp: urumi/woo-mcp:0.1.0

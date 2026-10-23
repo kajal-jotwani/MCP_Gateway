@@ -1,0 +1,86 @@
+{{- $component := dict "root" $ "name" "mariadb" }}
+# Headless Service: it governs the StatefulSet and resolves to the database pod for clients.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mariadb
+  labels:
+    {{- include "store.labels" $component | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "store.selectorLabels" $component | nindent 4 }}
+  ports:
+    - name: mysql
+      port: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mariadb
+  labels:
+    {{- include "store.labels" $component | nindent 4 }}
+spec:
+  serviceName: mariadb
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "store.selectorLabels" $component | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "store.labels" $component | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mariadb
+          image: {{ .Values.images.mariadb }}
+          ports:
+            - name: mysql
+              containerPort: 3306
+          env:
+            {{- include "store.secretEnv" (list . "MARIADB_ROOT_PASSWORD" "MARIADB_ROOT_PASSWORD") | nindent 12 }}
+            - name: MARIADB_DATABASE
+              value: wordpress
+            - name: MARIADB_USER
+              value: wordpress
+            {{- include "store.secretEnv" (list . "MARIADB_PASSWORD" "MARIADB_PASSWORD") | nindent 12 }}
+          securityContext:
+            {{- include "store.restrictedContainer" . | nindent 12 }}
+          # healthcheck.sh ships with the image and logs in with the healthcheck user that the
+          # entrypoint creates on first start.
+          startupProbe:
+            exec:
+              command: ["healthcheck.sh", "--connect", "--innodb_initialized"]
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["healthcheck.sh", "--connect", "--innodb_initialized"]
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["healthcheck.sh", "--connect"]
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.resources.mariadb | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+  # StatefulSet claims are not deleted by `helm uninstall`, so the store data outlives the release.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.storage.className }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.mariadbSize }}

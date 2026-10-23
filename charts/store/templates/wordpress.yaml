@@ -1,0 +1,115 @@
+{{- $component := dict "root" $ "name" "wordpress" }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wp-content
+  labels:
+    {{- include "store.labels" $component | nindent 4 }}
+  annotations:
+    # Plugins and uploads live here; keep them when the release is uninstalled.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ .Values.storage.className }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.wpContentSize }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordpress
+  labels:
+    {{- include "store.labels" $component | nindent 4 }}
+spec:
+  replicas: 1
+  # The wp-content volume is ReadWriteOnce, so the old pod must stop before the new one starts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "store.selectorLabels" $component | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "store.labels" $component | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 33
+        runAsGroup: 33
+        fsGroup: 33
+        seccompProfile:
+          type: RuntimeDefault
+        # Lets Apache bind port 80 without root. This sysctl is namespaced and allowed by default.
+        sysctls:
+          - name: net.ipv4.ip_unprivileged_port_start
+            value: "0"
+      initContainers:
+        {{- include "store.volumeOwnerInit" (list . (dict "name" "wp-content" "path" "/var/www/html/wp-content")) | nindent 8 }}
+      containers:
+        - name: wordpress
+          image: {{ .Values.images.wordpress }}
+          ports:
+            - name: http
+              containerPort: 80
+          env:
+            {{- include "store.wordpressEnv" . | nindent 12 }}
+          securityContext:
+            {{- include "store.restrictedContainer" . | nindent 12 }}
+          # wp-login.php loads WordPress and queries the database, so a broken database connection
+          # takes the pod out of the Service. It answers 200 or a redirect when healthy.
+          readinessProbe:
+            httpGet:
+              path: /wp-login.php
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources.wordpress | nindent 12 }}
+          volumeMounts:
+            - name: wp-content
+              mountPath: /var/www/html/wp-content
+      volumes:
+        - name: wp-content
+          persistentVolumeClaim:
+            claimName: wp-content
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wordpress
+  labels:
+    {{- include "store.labels" $component | nindent 4 }}
+spec:
+  selector:
+    {{- include "store.selectorLabels" $component | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: wordpress
+  labels:
+    {{- include "store.labels" $component | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ (urlParse .Values.store.url).hostname | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: wordpress
+                port:
+                  name: http
