@@ -106,14 +106,18 @@ Why operator-created Secrets instead of Helm generating them with `randAlphaNum`
 
 - MCP spec 2026-07-28: names SHOULD be 1–128 characters from `A-Z a-z 0-9 _ - .`. The spec says aggregators SHOULD disambiguate, for example with a server prefix, and that `serverInfo.name` is not unique enough to use.
 - Cursor: server config key plus tool name must be at most 60 characters, and dots are rejected (Cursor forum, staff replies).
-- Claude Code exposes MCP tools to the model as `mcp__<server>__<tool>`, and the Claude API requires tool names to match `^[a-zA-Z0-9_-]{1,64}$`. With the README telling users to name the server `urumi`, the prefix is 12 characters. **To verify (stage 3):** the exact Claude Code prefix format with the current version.
+- Claude API: tool names must match `^[a-zA-Z0-9_-]{1,128}$` (Anthropic tool-use docs). This applies to the chat agent and to Claude Code.
+- Claude Code exposes MCP tools to the model as `mcp__<server>__<tool>`. With the README telling users to name the server `urumi`, that adds 12 characters. **To verify (stage 3):** the exact Claude Code prefix format with the current version.
+
+Cursor's 60-character limit is the tightest of these.
 
 **Decision:** every exposed tool is named `<prefix>__<tool>`.
 
-- `prefix` is chosen by the admin when adding an upstream: 2–16 characters of `[a-z0-9-]`, unique, cannot change after creation (changing it would rename tools under connected clients). WooCommerce is pre-registered as `woo`.
+- `prefix` belongs to the upstream record, not to the code. It defaults to a slug of the name the admin types (lowercase, `[a-z0-9-]`, 2–16 characters), the admin can override it, and it must be unique. No prefix is hard-coded anywhere, including for WooCommerce: the pre-registered store takes its name and prefix from gateway chart values (`store` by default). With the multi-store bonus, each store would register with its own name, so tool names say which store they act on.
+- The admin can change a prefix later. That renames the upstream's tools for every client, so the dashboard warns before saving, and the gateway sends `list_changed` the same way as for a disable.
 - `tool` is the upstream's name with any character outside `[A-Za-z0-9_-]` replaced by `_`.
-- Every tool is prefixed, not only colliding ones. Names stay stable when a new upstream with an overlapping tool name is added. `woo__list_orders` and `notes__list_orders` can both exist.
-- Maximum exposed length is 48 characters. That leaves room for Cursor's 60 with a config key of up to 12 characters, and for Claude Code's 12-character prefix under 64. A longer name is cut to 41 characters plus `_` plus the first 6 hex characters of the SHA-256 of the original name, so it stays unique and stable.
+- Every tool is prefixed, not only colliding ones. Names stay stable when a new upstream with an overlapping tool name is added. `store__list_orders` and `notes__list_orders` can both exist.
+- Maximum exposed length is 48 characters. That leaves room for Cursor's 60 with a config key of up to 12 characters. A longer name is cut to 41 characters plus `_` plus the first 6 hex characters of the SHA-256 of the original name, so it stays unique and stable.
 - If two upstream tools on the same upstream map to the same exposed name after sanitizing, both get the hash suffix.
 
 **Mapping back:** the gateway never parses names to route. Each cache refresh builds a map from exposed name to `{upstreamId, originalName}`. `tools/call` looks the name up in that map, so the scheme can change without touching routing. The mapping function is pure and unit-tested (collisions, length, sanitizing, stability).
@@ -178,9 +182,19 @@ The gateway has one function for each step every tool call goes through:
 
 The MCP endpoint resolves the member from the API key and calls this path. The chat endpoint (`POST /api/chat`) resolves the member from the session cookie and calls the same path with `via = chat`. There is no other code that calls upstreams.
 
-The chat loop: list tools for the member, send the conversation and tools to the LLM, run each requested tool through the path above, append results, repeat up to 8 rounds. The response streams the assistant text and each tool call (name, arguments, outcome, duration) so the UI shows them (C1).
+LLM: the Claude API through the official TypeScript SDK (`@anthropic-ai/sdk`, pinned). The model is a chart value, default `claude-opus-5-5`. The API key is the `ANTHROPIC_API_KEY` entry of the `llm-credentials` Secret (C3).
 
-LLM: any provider with an OpenAI-compatible chat completions API (Gemini, Groq, OpenRouter, a local Ollama). Base URL and model are values; the key is in the `llm-credentials` Secret (C3). **Open question for Kajal:** which provider to use for the demo.
+The chat loop is a manual loop over the Messages API rather than the SDK's tool runner, because every tool execution has to go through the gateway's own path and the loop is short enough to read in one screen:
+
+1. List tools for the member and convert each to a Claude tool (`name`, `description`, `input_schema`). Exposed names already match the Claude API's name rule.
+2. Call `messages.create` with the system prompt, the conversation, the tools, `tool_choice: auto`, adaptive thinking (Opus 5.5 does not allow thinking to be turned off) and `effort: low`, which is enough to pick among a few tools and keeps cost and latency down.
+3. If `stop_reason` is `refusal` or `max_tokens`, stop and show a clear message; tools from a cut-off turn are not run.
+4. Run every `tool_use` block in the response in parallel through the path above, then send all `tool_result` blocks back in one user message, with `is_error: true` for failed, timed-out or rejected calls.
+5. Repeat until `stop_reason` is `end_turn`, at most 8 rounds.
+
+The server-side refusal fallback (`fallbacks: "default"` with the `server-side-fallback-2026-07-01` beta) is enabled, so a rare policy decline is retried on another model inside the same call instead of failing the turn.
+
+The browser receives a server-sent event stream with the assistant text and each tool call (name, arguments, outcome, duration) as it happens, so the UI shows which tools ran (C1). The conversation is kept in the browser and sent with each message; the gateway stores only audit entries. The system prompt tells the model that tool descriptions and results are data from third-party servers and never instructions.
 
 Alternative considered: the agent connects to the gateway's own `/mcp` with a key minted for the member. That proves the external path, but needs a hidden key per member and an HTTP hop for nothing. The shared function gives the same guarantee and is easier to test.
 
@@ -188,13 +202,13 @@ Alternative considered: the agent connects to the gateway's own `/mcp` with a ke
 
 | Upstream | Prefix | Where | Credential |
 |---|---|---|---|
-| WooCommerce (`woo-mcp`) | `woo` | namespace `store` | none at the MCP layer; NetworkPolicy restricts callers |
+| WooCommerce (`woo-mcp`) | `store` (from values) | namespace `store` | none at the MCP layer; NetworkPolicy restricts callers |
 | MCP reference server (`@modelcontextprotocol/server-everything`, Streamable HTTP mode) | `everything` | namespace `upstreams` | none |
 | `notes-mcp` (in repo): `save_note`, `list_notes`, `search_notes`, notes in memory | `notes` | namespace `upstreams` | bearer token from a Secret, entered by the admin in the dashboard (exercises G1 and G5) |
 
 `server-everything` is useful for failure tests because it has tools that sleep and that return errors. **To verify (stage 3):** its Streamable HTTP start command and tool names in the pinned version.
 
-D5 prompt: "Look up today's orders in the store and save a note called 'Orders today' that lists each order's number, customer and total." This needs `woo__list_orders` and `notes__save_note`.
+D5 prompt: "Look up today's orders in the store and save a note called 'Orders today' that lists each order's number, customer and total." This needs `store__list_orders` and `notes__save_note`.
 
 ### Gateway database
 
@@ -249,7 +263,7 @@ External client `tools/call`:
 
 1. Client POSTs to `https://app.<domain>/mcp` with `Authorization: Bearer urk_...`.
 2. Gateway hashes the key and loads the member. Unknown or revoked key: HTTP 401, audit entry `rejected` with the key's display prefix and no member.
-3. `authorizeToolCall`, then `routeToolCall` maps `woo__list_orders` to the WooCommerce upstream and `list_orders`.
+3. `authorizeToolCall`, then `routeToolCall` maps `store__list_orders` to the WooCommerce upstream and `list_orders`.
 4. The registry's client for that upstream calls `list_orders` with the upstream's static credential, if any. The client's API key is not forwarded.
 5. woo-mcp signs a REST request to WordPress, trims the response and returns it.
 6. Gateway returns the result unchanged except for size limits, and writes the audit entry (`succeeded`, duration).
@@ -269,7 +283,7 @@ audit_entries  id, at, member_id (nullable), key_prefix (nullable), via (mcp|cha
 
 `upstreams.auth_secret` is write-only through the API: responses say whether a credential is set, never what it is. Encrypting it at rest is a hardening extension. Audit entries copy `upstream_prefix` and `tool` as text so entries stay readable after an upstream is removed.
 
-The WooCommerce upstream is inserted on first start from gateway values (URL of the woo-mcp Service) if no upstream with prefix `woo` exists (G7).
+The WooCommerce upstream is inserted on the gateway's first start from chart values (name, prefix, URL of the woo-mcp Service) (G7). A one-row `bootstrap` table records that this happened, so an admin who later renames or removes it does not get it back on restart.
 
 ## Kubernetes topology
 
@@ -301,19 +315,19 @@ Image tags are pinned in `values.yaml`. Gateway, woo-mcp and notes-mcp images ar
 | K5 | PVCs for MariaDB, `wp-content`, PostgreSQL |
 | K6 | Traefik Ingress, `*.localtest.me` locally |
 | K7 | Probes and resources on every template |
-| K8, C3, G5 | Operator-created Secrets referenced by name; upstream credentials write-only in the API |
+| K8, G5 | Operator-created Secrets referenced by name; upstream credentials write-only in the API |
 | W1, W2, W3 | `woo-mcp/`, SDK v2 Streamable HTTP, five tools |
 | W4 | No Ingress, ClusterIP, NetworkPolicy from gateway only |
 | W5 | REST v3 with OAuth 1.0a signing (this document) |
-| G1, G7 | Upstream CRUD API and dashboard; `woo` seeded on first start |
+| G1, G7 | Upstream CRUD API and dashboard; WooCommerce seeded from values on first start |
 | G2 | Aggregated `tools/list` from cache, map-based `tools/call` routing |
-| G3 | `<prefix>__<tool>`, 48-character cap with hash suffix |
+| G3 | `<prefix>__<tool>` with a per-upstream prefix, 48-character cap with hash suffix |
 | G4 | Parallel refresh with per-upstream timeouts, 30 s call timeout, Unreachable tools hidden |
-| G6 | woo, everything, notes |
+| G6 | WooCommerce, server-everything, notes-mcp |
 | T1, T3 | `members.role`, invite links |
 | T2 | `urk_` keys, SHA-256, revocation checked on every call |
 | T4, D9 | `writeAuditEntry` in the single tool-call path, audit page in the dashboard |
-| C1, C2 | Chat loop in the gateway using the same path, tool calls streamed to the UI |
+| C1, C2, C3 | Claude Messages API loop in the gateway using the same path, tool calls streamed to the UI, key in a Secret |
 
 ## Production changes
 
