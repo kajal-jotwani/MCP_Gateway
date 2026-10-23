@@ -31,13 +31,13 @@ storage:
 resources:
   mariadb:
     requests: { cpu: 100m, memory: 256Mi }
-    limits: { cpu: "1", memory: 768Mi }
+    limits: { cpu: '1', memory: 768Mi }
   wordpress:
     requests: { cpu: 100m, memory: 256Mi }
-    limits: { cpu: "1", memory: 512Mi }
+    limits: { cpu: '1', memory: 512Mi }
   setup:
     requests: { cpu: 100m, memory: 128Mi }
-    limits: { cpu: "1", memory: 512Mi }
+    limits: { cpu: '1', memory: 512Mi }
   wooMcp:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 500m, memory: 256Mi }

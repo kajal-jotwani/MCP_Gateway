@@ -3,4 +3,4 @@ name: store
 description: WordPress and WooCommerce store with its database and the woo-mcp MCP server
 type: application
 version: 0.1.0
-appVersion: "11.2.1"
+appVersion: '11.2.1'
