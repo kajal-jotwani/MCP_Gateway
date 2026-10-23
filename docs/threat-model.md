@@ -23,11 +23,11 @@ What a member can do with it:
 
 What a member cannot do:
 
-- Read the credential. The API never returns it: admins see only whether one is set, and members do not see URLs or credential details at all. It is not in logs, error messages, tool results the gateway produces, or the chat context.
+- Read the credential. The API never returns it: admins see only its type (bearer or header) and the header name, never the secret, and members do not see URLs or credential details at all. It is not in logs, error messages, tool results the gateway produces, or the chat context.
 - Send it somewhere else. Only the gateway's upstream client attaches it, only to the stored URL, and redirects are refused, so it cannot follow a redirect to another host. Changing an upstream's URL requires entering the credential again, so a stored secret is never sent to a new address by someone who does not know it.
 - Reach the upstream around the gateway. The bundled upstreams and woo-mcp accept connections only from the gateway's pods (NetworkPolicies), so a pod in the cluster cannot call them with a guessed or leaked credential.
 
-Residual risk: an upstream tool that echoes its request back reveals the credential. `server-everything` has such tools (`get-header-params` returns the request's headers, `get-env` the server's environment). It is registered without a credential, so there is nothing to leak, but an admin must not attach a credential to a server with tools like these. Encrypting stored credentials at rest is not implemented; anyone with database access reads them.
+Residual risk: an upstream tool that echoes its request headers back would reveal the credential, and a tool that returns the server's environment (`server-everything` has `get-env`) reveals any credential the server keeps there. `server-everything` is registered without a credential and keeps none in its environment, so there is nothing to leak, but an admin should check a server's tools before attaching a credential to it. Encrypting stored credentials at rest is not implemented; anyone with database access reads them.
 
 ## Why client API keys are not passed to upstreams
 
@@ -46,9 +46,9 @@ Tool names, descriptions, input schemas and results come from upstream servers a
 Mechanisms:
 
 - Names are sanitized to `[A-Za-z0-9_-]`, capped at 48 characters, and renamed on collisions. An upstream cannot take over another upstream's tool name: when two expose the same name, both are prefixed, and a name that is still ambiguous is dropped. Routing uses a map built by the gateway, never the name's text.
-- Results over 1 MB are refused, and upstream `_meta` is dropped. The chat agent passes Claude only the text parts of a result, at most 50,000 characters, and names other content types instead of sending them.
+- Results over 1 MB are refused, and the result's top-level `_meta` is dropped; content items are passed to MCP clients as the upstream sent them. The chat agent passes Claude only the text parts of a result (or, when it has no content, its structured content as JSON), at most 50,000 characters, and names other content types instead of sending them.
 - The chat agent's system prompt says that tool descriptions and results are data, not instructions, that it must tell the member when they ask for something the member did not, and that it changes things only when the member asked for the change.
-- Transport and protocol errors from upstreams are reduced to a short reason with no URL or credential before they reach the member or the model.
+- Transport failures are reduced to a short reason with no URL or credential before they reach the member or the model. When an upstream answers a call with a protocol error, its message is passed on, capped at 500 characters, and is untrusted text like a result.
 
 What is not prevented:
 
@@ -74,7 +74,7 @@ Only admins add servers, and admin changes to servers are not written to the aud
 - It can try to manipulate the model through descriptions and results, as above. Through the chat agent, an injected instruction can cause calls to other upstreams with the member's access. This is the most serious effect, and the reason only admins can add servers.
 - It can shadow another server's tool by exposing the same name. The collision scheme renames both instead of letting either win, the dashboard shows the rename and why, and connected clients are told the list changed.
 - It can change its tool list at any time. The gateway re-lists on the server's `list_changed` notification and every 15 s, and clients see the new list.
-- It runs wherever its URL points. The gateway can reach any address its pod can reach, including cluster-internal Services, so an admin can point an "upstream" at an internal HTTP service (server-side request forgery limited to admins). The gateway sends only MCP requests there and shows members only the resulting tool list. Restricting egress is not implemented, because upstreams may live anywhere.
+- It runs wherever its URL points. The gateway can reach any address its pod can reach, including cluster-internal Services, so an admin can point an "upstream" at an internal HTTP service (server-side request forgery limited to admins). The gateway sends only MCP requests there and shows members only the resulting tool list and a short status (Connected or Unreachable, with a reason such as the HTTP status or a timeout). Restricting egress is not implemented, because upstreams may live anywhere.
 
 Recovery: disabling or removing the server removes its tools from every client on their next list and from the chat agent's next turn. Audit entries keep the server's name, so its past calls stay visible after it is removed.
 

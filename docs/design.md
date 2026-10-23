@@ -95,7 +95,7 @@ Why operator-created Secrets instead of Helm generating them with `randAlphaNum`
 
 **Decision: one long-lived client per enabled upstream,** owned by an upstream registry in the gateway process.
 
-- On start, and when an admin adds, edits or enables an upstream, the registry connects (SDK negotiates the protocol era) and lists tools.
+- On start, and when an admin adds or enables an upstream or changes its URL or credential, the registry connects (SDK negotiates the protocol era) and lists tools. A name or slug change only recomputes the exposed names.
 - Every 15 s a refresh loop lists tools on every enabled upstream in parallel, each with a 5 s timeout (and 5 s to connect). Success sets **Connected** and replaces the cached tool list. Failure sets **Unreachable**, records the reason (timeout, connection refused, HTTP status, protocol error), and drops a broken client so the next refresh reconnects.
 - A tool call that fails at the transport level marks that upstream Unreachable immediately, so the dashboard updates without waiting for the next refresh (D8).
 - **Disabled** comes from the database. A disabled upstream has no client and no tools.
@@ -129,7 +129,7 @@ Collisions are not part of the normal three-upstream setup. They are covered by 
 
 ### How clients learn the tool list changed (D7)
 
-The gateway's `tools/list` is built on each request from the current cache and the current enabled set in the database. So any client that lists again sees the change.
+The gateway's `tools/list` is served from the registry's in-memory state: the cached tools of enabled, connected upstreams. Every admin change re-reads the upstreams table into the registry before the API responds, so any client that lists again sees the change.
 
 On top of that:
 
@@ -151,7 +151,7 @@ On top of that:
 
 A timed-out call is cancelled (the SDK aborts the request) and returns an MCP tool error: `Upstream "Notes" did not respond within 30 s.` Unreachable upstreams return `Upstream "Notes" is unreachable.` Neither message includes URLs or credentials. Upstream results over 1 MB are replaced by an error, and the chat agent passes Claude at most 50,000 characters of one result.
 
-Cache invalidation: the per-upstream tool cache is replaced on every successful refresh, on admin edits, and on upstream `list_changed`. It is dropped when the upstream is disabled or removed. Tools from an Unreachable upstream are hidden from `tools/list`, because listing tools that will fail wastes the model's turns.
+Cache invalidation: the per-upstream tool cache is replaced on every successful refresh, on admin edits to the URL or credential, and on upstream `list_changed`. It is dropped when the upstream is disabled or removed. Tools from an Unreachable upstream are hidden from `tools/list`, because listing tools that will fail wastes the model's turns.
 
 ### Human login and invites
 
@@ -205,6 +205,13 @@ Alternative considered: the agent connects to the gateway's own `/mcp` with a ke
 
 ### Additional upstreams and the D5 prompt
 
+| Option | For | Against |
+|---|---|---|
+| Hosted public MCP servers (for example a vendor's remote server) | Real third-party behavior | Need outside accounts and credentials, internet egress from the cluster, and break when the vendor changes; the demo cannot run offline |
+| In-cluster servers: the official reference server plus a small server written here | Reproducible with `helm install`; the reference server has failure tools (sleep, errors); the in-repo server can require a bearer token | Less realistic data |
+
+**Decision: in-cluster servers,** both installed by the gateway chart:
+
 | Upstream | Where | Credential |
 |---|---|---|
 | WooCommerce (`woo-mcp`) | namespace `store`, pre-registered | none at the MCP layer; NetworkPolicy restricts callers |
@@ -226,7 +233,12 @@ D5 prompt: "Look up today's orders in the store and save a note called 'Orders t
 
 ### Ingress and local domains
 
-**Decision: Traefik,** which ships with k3s and k3d, so local and VPS use the same controller and the same Ingress objects.
+| Option | For | Against |
+|---|---|---|
+| Traefik | Ships with k3s and k3d, so nothing extra to install or pin | Its own annotations for anything beyond plain Ingress |
+| ingress-nginx | Widely documented | One more chart to install and pin on both clusters, with k3s's Traefik disabled; Kubernetes announced its retirement (best-effort maintenance until March 2026) |
+
+**Decision: Traefik,** so local and VPS use the same controller and the same Ingress objects.
 
 Local hostnames: `store.localtest.me` and `app.localtest.me`. `localtest.me` and every subdomain resolve to 127.0.0.1 in public DNS, so browsers and CLI clients work without editing `/etc/hosts` (**To verify:** resolution on a Mac; the build sandbox has no outside DNS and used `/etc/hosts`). The k3d cluster maps host port 80 to its load balancer. Offline fallback, documented in the README: add both names to `/etc/hosts`.
 
@@ -238,7 +250,13 @@ WordPress `siteurl` is `http://store.localtest.me`. Inside the pod that name res
 
 ### NetworkPolicies on the local cluster
 
-**Decision: k3d.** k3s includes an embedded network policy controller (kube-router) next to flannel, so NetworkPolicies are enforced locally and on the VPS with the same objects, and the local cluster matches the VPS distribution.
+| Option | Enforces NetworkPolicies | Against |
+|---|---|---|
+| k3d (k3s in Docker) | Yes: k3s embeds a network policy controller (kube-router) next to flannel | None for this project |
+| Kind | kindnet implements NetworkPolicies through kube-network-policies, depending on the Kind release | A different distribution and Ingress setup from the VPS |
+| Minikube | Only with a policy-enforcing CNI such as Calico | An extra CNI to install, which the VPS does not use |
+
+**Decision: k3d,** because the local cluster then runs the same distribution as the VPS, and NetworkPolicies are enforced in both with the same objects.
 
 Each chart has a default-deny ingress policy for its namespace, then allows (`charts/*/templates/networkpolicies.yaml`):
 
@@ -261,8 +279,9 @@ The gateway process does hold state in memory: the upstream clients, the tool ca
 - Each replica would run its own refresh loop, so status could briefly differ between replicas and dashboard reads could flip.
 - An admin action handled by replica A would publish `list_changed` only to listeners connected to replica A.
 - Each replica would double the health traffic to upstreams.
+- Each replica reads the upstreams table only at start and when it handles an admin change itself. An add, edit, disable or remove handled by replica A would not reach replica B, which would keep listing and calling the old set until it restarts. This is the failure that matters: D7 would break on B.
 
-Calls, listing, auth and audit would still be correct, because they read PostgreSQL and the cache rebuilds itself. The chart runs one replica. Fixing the above would mean storing status in PostgreSQL and fanning notifications out with `LISTEN/NOTIFY`; that is the scaling extension and out of scope.
+Auth and audit would still be correct, because they read and write PostgreSQL on every request. The chart runs one replica. Fixing the above would mean re-reading the upstreams table periodically or on `LISTEN/NOTIFY`, and storing status in PostgreSQL; that is the scaling extension and out of scope.
 
 ## Request flows
 
@@ -270,10 +289,10 @@ External client `tools/call`:
 
 1. Client POSTs to `https://app.<domain>/mcp` with `Authorization: Bearer urk_...`.
 2. Gateway hashes the key and loads the member. Missing, unknown or revoked key, or a deactivated member's key: HTTP 401 and an audit entry `rejected` with the key's display prefix. A revoked key or a deactivated member's key matches a stored hash, so the entry is attributed to that member; an unknown key has no member.
-3. `authorizeToolCall`, then `routeToolCall` maps `list_orders` to the WooCommerce upstream and its original tool name.
+3. `callTool` (`gateway/src/toolCalls.ts`) checks `mayUseTools(member)`, then `registry.resolve` maps `list_orders` to the WooCommerce upstream and its original tool name.
 4. The registry's client for that upstream calls `list_orders` with the upstream's static credential, if any. The client's API key is not forwarded.
 5. woo-mcp signs a REST request to WordPress, trims the response and returns it.
-6. Gateway returns the result unchanged except for size limits, and writes the audit entry (`succeeded`, duration).
+6. Gateway returns the upstream's content, structured content and error flag (the result's own `_meta` is dropped), refusing results over 1 MB, and writes the audit entry (`succeeded`, duration).
 
 Chat: browser POSTs to `/api/chat` with the session cookie. The gateway runs the LLM loop and uses steps 3–6 for each tool call, as that member, with `via = chat`.
 
@@ -321,6 +340,7 @@ Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and ever
 | Req | Mechanism |
 |---|---|
 | K1, K2, K3 | Two Helm charts; k3d locally, k3s on the VPS; differences only in `values-*.yaml` |
+| K4 | WordPress, MariaDB, the setup Job, woo-mcp, the gateway (with the dashboard), PostgreSQL, notes-mcp and server-everything all run as workloads of the two charts |
 | K5 | PVCs for MariaDB, `wp-content`, PostgreSQL |
 | K6 | Traefik Ingress, `*.localtest.me` locally |
 | K7 | Probes and resources on every template |
@@ -346,7 +366,7 @@ Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and ever
 - Ingress: same Traefik class; TLS with cert-manager and Let's Encrypt is an optional extension.
 - Storage class: k3s `local-path` (the default on both k3d and k3s; set explicitly so the choice is visible).
 - Images: public GHCR packages (`ghcr.io/kajal-jotwani/...`, same tags) instead of locally imported images, so the charts need no image pull secret.
-- Resources: higher memory limits for WordPress and MariaDB (1 GiB each).
+- Resources: higher memory limits for WordPress and MariaDB (1 GiB each) and a higher MariaDB memory request (384 MiB).
 - Secrets: created with the same `kubectl` commands on the VPS, with new random values.
 
 **Verified (stage 8)** on the test k3s with a fresh install of both charts from `values-prod.yaml` in new namespaces (hostnames and the namespace wiring set with `--set`, images loaded under their GHCR names): the setup Job completed, all three upstreams connected, and the two-user acceptance run D1 to D9 passed. The run on a real VPS is still to do.

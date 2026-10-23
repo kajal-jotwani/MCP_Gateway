@@ -93,7 +93,7 @@ helm upgrade --install store charts/store -n store -f charts/store/values-local.
 helm upgrade --install gateway charts/gateway -n gateway -f charts/gateway/values-local.yaml --rollback-on-failure --timeout 10m
 ```
 
-The store chart's setup Job installs WordPress and WooCommerce, enables cash on delivery, stores the REST key for woo-mcp and adds two sample products. It runs on every install and upgrade and only changes what is missing, so no step in wp-admin is needed.
+The store chart's setup Job installs WordPress and WooCommerce, enables cash on delivery, stores the REST key for woo-mcp and adds two sample products. It runs on every install and upgrade, and every step is safe to repeat: it creates what is missing and resets the store settings it manages (timezone, permalinks, currency, country, coming-soon mode, shipping) to the chart values. No step in wp-admin is needed, and a change to those settings made in wp-admin is undone by the next upgrade.
 
 ### 5. Open the store and the dashboard
 
@@ -131,7 +131,7 @@ On the storefront, add a product to the cart, go to checkout, fill in the addres
 
 ### Connect an external MCP client
 
-The **Connect a client** page shows these with the right URL filled in. Replace `<your API key>` with a key from the API keys page.
+The **Connect a client** page shows the Claude Code command, the Cursor configuration and the first Inspector command with the right URL filled in. Replace `<your API key>` with a key from the API keys page.
 
 Claude Code:
 

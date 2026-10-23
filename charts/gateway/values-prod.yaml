@@ -1,5 +1,6 @@
-# VPS running k3s. Set the dashboard URL to a hostname whose DNS A record points to the VPS, for
-# example app.<your-domain> or, without a domain, app.<vps-ip>.sslip.io. The README has the steps.
+# VPS running k3s. Set the dashboard URL to one whose hostname has a DNS A record pointing to the
+# VPS, for example http://app.<your-domain> or, without a domain, http://app.<vps-ip>.sslip.io.
+# The README has the steps.
 publicUrl: ''
 
 images:

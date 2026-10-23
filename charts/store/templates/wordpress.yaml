@@ -103,7 +103,7 @@ metadata:
 spec:
   ingressClassName: {{ .Values.ingress.className }}
   rules:
-    - host: {{ (urlParse (required "Set store.url to the public storefront URL." .Values.store.url)).hostname | quote }}
+    - host: {{ required "Set store.url to the public storefront URL, such as http://store.example.com." (urlParse .Values.store.url).hostname | quote }}
       http:
         paths:
           - path: /

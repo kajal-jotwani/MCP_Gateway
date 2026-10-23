@@ -1,5 +1,6 @@
-# VPS running k3s. Set the storefront URL to a hostname whose DNS A record points to the VPS, for
-# example store.<your-domain> or, without a domain, store.<vps-ip>.sslip.io. The README has the steps.
+# VPS running k3s. Set the storefront URL to one whose hostname has a DNS A record pointing to the
+# VPS, for example http://store.<your-domain> or, without a domain, http://store.<vps-ip>.sslip.io.
+# The README has the steps.
 store:
   url: ''
 
