@@ -43,6 +43,12 @@ so sessions and cart cookies survive pod restarts.
     // Versions are pinned in the chart; WordPress must not update itself or its plugins.
     define('AUTOMATIC_UPDATER_DISABLED', true);
     define('DISALLOW_FILE_EDIT', true);
+    // The setup Job installs WordPress with WP-CLI. Until it has, every page redirects to the web
+    // installer, which would let whoever finds the site first create the admin account.
+    if (!defined('WP_CLI') && str_ends_with($_SERVER['SCRIPT_NAME'] ?? '', '/wp-admin/install.php')) {
+      http_response_code(403);
+      exit('The store is set up by its Helm chart.');
+    }
 {{- end }}
 
 {{- define "store.restrictedContainer" -}}

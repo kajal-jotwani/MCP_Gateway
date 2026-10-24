@@ -21,6 +21,11 @@ spec:
       containers:
         - name: everything
           image: {{ .Values.images.everything }}
+          env:
+            # gzip-file-as-resource fetches any URL a caller names and returns the body, so without
+            # this every member could read internal addresses. This is the domain of its default URL.
+            - name: GZIP_ALLOWED_DOMAINS
+              value: raw.githubusercontent.com
           ports:
             - name: mcp
               containerPort: 3001
