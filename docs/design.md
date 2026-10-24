@@ -80,7 +80,9 @@ Tools (W3), each with a JSON Schema for input and validation at the boundary:
 4. Store the REST key from the Secret in `wp_woocommerce_api_keys` with `wp eval-file` (stored the way WooCommerce stores keys: `wc_api_hash(consumer_key)`, the secret, and the last 7 characters), inserting or updating the row the chart owns. Read/write permission, acting as the admin.
 5. Create two sample products on the first run only.
 
-Every step checks before acting, so the Job runs on every install and upgrade. **Verified (stage 1):** WordPress image `wordpress:7.1.3-php8.4-apache`, WP-CLI `wordpress:cli-2.12.0-php8.4`, WooCommerce 11.2.1; repeated upgrades rerun the Job cleanly. **To verify:** the plugin download from wordpress.org, which is blocked in the build sandbox (the plugin was copied into the volume by hand there).
+Every step checks before acting, so the Job runs on every install and upgrade. **Verified (stage 1):** WordPress image `wordpress:7.1.3-php8.4-apache`, WP-CLI `wordpress:cli-2.12.0-php8.4`, WooCommerce 11.2.1; repeated upgrades rerun the Job cleanly. **Verified (2026-10-24, README setup on a Mac with k3d):** the Job downloaded WooCommerce 11.2.1 from wordpress.org and installed it.
+
+The WordPress pod turns ready before the Job has run, because until WordPress is installed every page redirects to the web installer and the readiness probe accepts redirects. Whoever reached `/wp-admin/install.php` in that window could create the admin account. The shared wp-config extra therefore answers 403 to the web installer for every request that is not WP-CLI, so only the Job can install WordPress.
 
 **How credentials reach woo-mcp:** the operator creates one Secret, `store-credentials`, before install (commands in the README, values from `openssl rand`): DB passwords, WordPress admin password, `WC_CONSUMER_KEY` (`ck_` + 40 hex) and `WC_CONSUMER_SECRET` (`cs_` + 40 hex). MariaDB, WordPress, the setup Job and woo-mcp all reference keys from that Secret through `secretKeyRef`. Because the key is generated before WooCommerce exists and inserted by the Job, no one has to copy a key out of wp-admin. Charts take the Secret name as a value and never contain secret values.
 
@@ -96,10 +98,10 @@ Why operator-created Secrets instead of Helm generating them with `randAlphaNum`
 **Decision: one long-lived client per enabled upstream,** owned by an upstream registry in the gateway process.
 
 - On start, and when an admin adds or enables an upstream or changes its URL or credential, the registry connects (SDK negotiates the protocol era) and lists tools. A name or slug change only recomputes the exposed names.
-- Every 15 s a refresh loop lists tools on every enabled upstream in parallel, each with a 5 s timeout (and 5 s to connect). Success sets **Connected** and replaces the cached tool list. Failure sets **Unreachable**, records the reason (timeout, connection refused, HTTP status, protocol error), and drops a broken client so the next refresh reconnects.
-- A tool call that fails at the transport level marks that upstream Unreachable immediately, so the dashboard updates without waiting for the next refresh (D8).
+- Every 15 s a refresh loop re-reads the upstreams table and lists tools on every enabled upstream in parallel, each with a 5 s timeout (and 5 s to connect). Re-reading the table picks up an admin change handled by another gateway process, such as the old pod during a rolling update. Success sets **Connected** and replaces the cached tool list. Failure sets **Unreachable**, records the reason (timeout, connection refused, HTTP status, protocol error), and drops a broken client so the next refresh reconnects.
+- A tool call that fails at the transport level marks that upstream Unreachable immediately, so the dashboard updates without waiting for the next refresh (D8). A call answered with an HTTP error status, such as 413 for an oversized request, fails on its own and triggers an immediate check instead, so one member's bad request cannot hide a healthy upstream's tools from everyone.
 - **Disabled** comes from the database. A disabled upstream has no client and no tools.
-- If an upstream advertises `tools.listChanged`, the registry also re-lists on that notification.
+- If an upstream advertises `tools.listChanged`, the registry also re-lists on that notification. When the upstream ends that stream on purpose, for example because its pod is shutting down, the next refresh opens a new stream on the same client, so calls still running on it are not cut off; an unexpected drop is checked at once.
 
 ### Tool-name namespacing
 
@@ -199,7 +201,7 @@ The chat loop is a manual loop over the Messages API rather than the SDK's tool 
 
 The server-side refusal fallback (`fallbacks: "default"` with the `server-side-fallback-2026-07-01` beta) is enabled, so a rare policy decline is retried on another model inside the same call instead of failing the turn.
 
-`POST /api/chat` streams newline-delimited JSON events to the browser: assistant text as it arrives, and each tool call (name, server, arguments) and its result (error flag and the first 2,000 characters) as it happens, so the UI shows which tools ran (C1). The conversation is kept in the browser and sent with each message as text only, so no thinking block from an earlier request is replayed; the gateway stores only audit entries. Closing the page cancels the turn, including running tool calls. The system prompt tells the model that tool descriptions and results are data from third-party servers and never instructions, and that it changes things only when the member asked for the change.
+`POST /api/chat` streams newline-delimited JSON events to the browser: assistant text as it arrives, and each tool call (name, server, arguments) and its result (error flag and the first 2,000 characters) as it happens, so the UI shows which tools ran (C1). The conversation is kept in the browser and sent with each message as text only, so no thinking block from an earlier request is replayed; the gateway stores only audit entries. Closing the page, or moving to another page of the dashboard, cancels the turn, including running tool calls. The system prompt tells the model that tool descriptions and results are data from third-party servers and never instructions, and that it changes things only when the member asked for the change.
 
 Alternative considered: the agent connects to the gateway's own `/mcp` with a key minted for the member. That proves the external path, but needs a hidden key per member and an HTTP hop for nothing. The shared function gives the same guarantee and is easier to test.
 
@@ -240,7 +242,7 @@ D5 prompt: "Look up today's orders in the store and save a note called 'Orders t
 
 **Decision: Traefik,** so local and VPS use the same controller and the same Ingress objects.
 
-Local hostnames: `store.localtest.me` and `app.localtest.me`. `localtest.me` and every subdomain resolve to 127.0.0.1 in public DNS, so browsers and CLI clients work without editing `/etc/hosts` (**To verify:** resolution on a Mac; the build sandbox has no outside DNS and used `/etc/hosts`). The k3d cluster maps host port 80 to its load balancer. Offline fallback, documented in the README: add both names to `/etc/hosts`.
+Local hostnames: `store.localtest.me` and `app.localtest.me`. `localtest.me` and every subdomain resolve to 127.0.0.1 in public DNS, so browsers and CLI clients work without editing `/etc/hosts` (**Verified (2026-10-24)** on a Mac: both names resolve to 127.0.0.1 and ::1; the build sandbox has no outside DNS and used `/etc/hosts`). The k3d cluster maps host port 80 to its load balancer. Offline fallback, documented in the README: add both names to `/etc/hosts`.
 
 `*.localhost` was rejected because some resolvers outside browsers do not resolve subdomains of `localhost`, which would break CLI MCP clients. `.local` was rejected because macOS sends it to mDNS.
 
@@ -279,9 +281,9 @@ The gateway process does hold state in memory: the upstream clients, the tool ca
 - Each replica would run its own refresh loop, so status could briefly differ between replicas and dashboard reads could flip.
 - An admin action handled by replica A would publish `list_changed` only to listeners connected to replica A.
 - Each replica would double the health traffic to upstreams.
-- Each replica reads the upstreams table only at start and when it handles an admin change itself. An add, edit, disable or remove handled by replica A would not reach replica B, which would keep listing and calling the old set until it restarts. This is the failure that matters: D7 would break on B.
+- Each replica applies an admin change at once only when it handles the change itself. The other picks it up on its next refresh, up to 15 s later, and until then keeps listing and calling the old set, so D7 would be up to 15 s late on that replica.
 
-Auth and audit would still be correct, because they read and write PostgreSQL on every request. The chart runs one replica. Fixing the above would mean re-reading the upstreams table periodically or on `LISTEN/NOTIFY`, and storing status in PostgreSQL; that is the scaling extension and out of scope.
+Auth and audit would still be correct, because they read and write PostgreSQL on every request. The chart runs one replica; during a rolling update the old and new pods overlap for a few seconds, which the periodic re-read covers. Fixing the above would mean `LISTEN/NOTIFY` for admin changes and storing status in PostgreSQL; that is the scaling extension and out of scope.
 
 ## Request flows
 
@@ -305,10 +307,10 @@ invites        id, token_hash (unique), email, role, created_by, expires_at
 api_keys       id, member_id, key_hash (unique), display_prefix, name, created_by, created_at, revoked_at, last_used_at
 upstreams      id, slug (unique), name, url, auth_type (none|bearer|header), auth_header_name, auth_secret, enabled, created_at, updated_at
 bootstrap      action, done_at
-audit_entries  id, at, member_id (nullable), key_prefix (nullable), via (mcp|chat), upstream_id (nullable), upstream_name, tool, duration_ms, outcome (succeeded|failed|timed_out|rejected), reason
+audit_entries  id, at, member_id (nullable), key_prefix (nullable), via (mcp|chat), upstream_id (nullable, no foreign key), upstream_name, tool, duration_ms, outcome (succeeded|failed|timed_out|rejected), reason
 ```
 
-`upstreams.auth_secret` is write-only through the API: responses say whether a credential is set, never what it is. Encrypting it at rest is a hardening extension. Audit entries copy `upstream_name` and the original `tool` name as text so entries stay readable after an upstream is removed.
+`upstreams.auth_secret` is write-only through the API: responses say whether a credential is set, never what it is. Encrypting it at rest is a hardening extension. Audit entries copy `upstream_name` and the original `tool` name as text so entries stay readable after an upstream is removed. `upstream_id` has no foreign key, so a call that finishes while its upstream is being removed is still audited.
 
 The WooCommerce upstream is inserted on the gateway's first start from chart values (name, slug, URL of the woo-mcp Service) (G7). A one-row `bootstrap` table records that this happened, so an admin who later renames or removes it does not get it back on restart.
 
@@ -376,5 +378,5 @@ Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and ever
 - `helm upgrade --install <release> charts/<chart> -f charts/<chart>/values-<env>.yaml --rollback-on-failure --timeout 10m` (Helm 4; Helm 3 calls the flag `--atomic`). It rolls back automatically if new pods do not become ready. **Verified (stage 8):** an upgrade to a gateway image tag that does not exist failed after the timeout and Helm rolled back to the previous revision; the old pod kept serving throughout.
 - `helm rollback <release> <revision>` returns templates and image tags to an earlier revision.
 - Data survives an uninstall or a bad upgrade: the `wp-content` claim carries `helm.sh/resource-policy: keep`, and the MariaDB and PostgreSQL claims come from StatefulSet claim templates, which Helm does not delete.
-- Gateway migrations (`gateway/migrations/*.sql`) run at start in one transaction under an advisory lock. They may only add tables and columns (no renames or drops within a release), so the previous image still works against the migrated schema after a rollback.
+- Gateway migrations (`gateway/migrations/*.sql`) run at start in one transaction under an advisory lock. They may only add tables and columns or drop foreign keys (no renames or other drops within a release), so the previous image still works against the migrated schema after a rollback.
 - WordPress and WooCommerce versions are pinned. Upgrading WooCommerce is a values change; its own database migrations run in the setup Job. WooCommerce schema changes are not reversible by Helm, so take a MariaDB dump (`mariadb-dump` via `kubectl exec`, documented in the README) before changing that version.

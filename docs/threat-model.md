@@ -27,7 +27,7 @@ What a member cannot do:
 - Send it somewhere else. Only the gateway's upstream client attaches it, only to the stored URL, and redirects are refused, so it cannot follow a redirect to another host. Changing an upstream's URL requires entering the credential again, so a stored secret is never sent to a new address by someone who does not know it.
 - Reach the upstream around the gateway. The bundled upstreams and woo-mcp accept connections only from the gateway's pods (NetworkPolicies), so a pod in the cluster cannot call them with a guessed or leaked credential.
 
-Residual risk: an upstream tool that echoes its request headers back would reveal the credential, and a tool that returns the server's environment (`server-everything` has `get-env`) reveals any credential the server keeps there. `server-everything` is registered without a credential and keeps none in its environment, so there is nothing to leak, but an admin should check a server's tools before attaching a credential to it. Encrypting stored credentials at rest is not implemented; anyone with database access reads them.
+Residual risk: an upstream tool that echoes its request headers back would reveal the credential, and a tool that returns the server's environment (`server-everything` has `get-env`) reveals any credential the server keeps there. `server-everything` is registered without a credential and keeps none in its environment, so there is nothing to leak, but an admin should check a server's tools before attaching a credential to it. A tool that fetches URLs turns an upstream into a proxy for every member: `server-everything`'s `gzip-file-as-resource` fetches any URL it is given and returns the body, so the chart limits it to `raw.githubusercontent.com` with `GZIP_ALLOWED_DOMAINS`. Encrypting stored credentials at rest is not implemented; anyone with database access reads them.
 
 ## Why client API keys are not passed to upstreams
 
@@ -60,10 +60,10 @@ What is not prevented:
 
 - Read and change shared data. Upstreams see one identity for the whole team, so a note saved by one member through notes-mcp can be read, searched and overwritten by every other member, and every member sees every order. Upstreams with per-user data need per-user credentials, which this gateway does not have (an OAuth extension would add them).
 - Not use another member's identity. API keys and sessions are per member, random, and stored only as hashes. A member cannot list, see or revoke another member's keys, and sees only their own audit entries.
-- Not hide their calls. Every tool call, including rejected ones and calls with a revoked key, is written to the audit log under the member before the response is returned. Members cannot edit or delete audit entries.
-- Deny service to others, within limits. There are no rate limits, so a member can keep upstreams busy with slow or heavy calls. Each call has a 30 s timeout and one slow upstream does not delay others, but nothing stops a member from saturating one upstream for everyone.
+- Not hide their calls. Every tool call, including rejected ones, calls with a revoked key and calls to a server removed while they ran, is written to the audit log under the member before the response is returned. Members cannot edit or delete audit entries.
+- Deny service to others, within limits. There are no rate limits, so a member can keep upstreams busy with slow or heavy calls. Each call has a 30 s timeout and one slow upstream does not delay others, but nothing stops a member from saturating one upstream for everyone. A request the upstream refuses with an HTTP error, such as an oversized one, fails only that call; it does not mark the upstream Unreachable for the team.
 
-Admins are not limited this way: they can deactivate a member (sessions and keys stop working on the next request), revoke any key, change roles, and read everyone's audit entries. An admin cannot demote or deactivate themselves, so the team always keeps an admin who can sign in.
+Admins are not limited this way: they can deactivate a member (sessions and keys stop working on the next request), revoke any key, change roles, and read everyone's audit entries. An admin cannot demote or deactivate themselves, and member changes run one at a time with the acting admin checked when the change is made, so two admins demoting each other at once cannot leave the team without an admin who can sign in.
 
 ## An admin adds a malicious or compromised server
 

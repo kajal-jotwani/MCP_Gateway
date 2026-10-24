@@ -173,7 +173,7 @@ Open **Chat** and ask, for example:
 - "Which orders came in today?"
 - "Look up today's orders in the store and save a note called 'Orders today' that lists each order's number, customer and total." This uses WooCommerce and Notes in one answer.
 
-Each tool call is shown under the answer with its arguments and result, and is recorded in the audit log under the signed-in member, marked **Chat**. The conversation lives in the page; leaving it ends the conversation.
+Each tool call is shown under the answer with its arguments and result, and is recorded in the audit log under the signed-in member, marked **Chat**. The conversation lives in the page; leaving it ends the conversation and stops an answer that is still running.
 
 ### Disable a server, or kill one
 
