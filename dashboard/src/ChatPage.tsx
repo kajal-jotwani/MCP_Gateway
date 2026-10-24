@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
 
 import { apiResponse } from './api';
@@ -99,6 +99,8 @@ export function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState('');
   const [running, setRunning] = useState<AbortController>();
+  // Leaving the page aborts the running turn, and the gateway then cancels its tool calls.
+  useEffect(() => () => running?.abort(), [running]);
 
   const updateAnswer = (change: (answer: AssistantMessage) => AssistantMessage) =>
     setMessages((current) => [...current.slice(0, -1), change(current.at(-1) as AssistantMessage)]);

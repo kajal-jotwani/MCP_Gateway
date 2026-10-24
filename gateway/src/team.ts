@@ -1,6 +1,7 @@
 import { randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
 
 import type { Database, Queryable } from './db.js';
+import { memberChangeRefusal } from './permissions.js';
 import { hashToken, newToken } from './tokens.js';
 
 export type Role = 'admin' | 'member';
@@ -124,8 +125,31 @@ export async function getMember(db: Queryable, id: string): Promise<Member | und
   return member;
 }
 
-/** Changes a member's role or active flag. A deactivated member's sessions and keys stop working at once. */
-export async function updateMember(
+/**
+ * Applies a role or active change that `actorId` makes to `targetId`. Returns the updated member,
+ * undefined when there is no such member, or why the change was refused. The active admins are locked
+ * and the actor is read inside the lock, so changes run one at a time and two admins demoting each other
+ * at once cannot leave the team without an admin. A deactivated member's sessions and keys stop working
+ * at once.
+ */
+export async function changeMember(
+  db: Database,
+  actorId: string,
+  targetId: string,
+  change: { role?: Role; active?: boolean },
+): Promise<Member | string | undefined> {
+  return db.transaction(async (tx) => {
+    // NO KEY UPDATE still makes these changes wait for each other, but not for inserts that reference a
+    // member, such as a new API key, which would otherwise deadlock with this lock.
+    await tx.query(`SELECT id FROM members WHERE role = 'admin' AND active FOR NO KEY UPDATE`);
+    const actor = await getMember(tx, actorId);
+    const target = await getMember(tx, targetId);
+    if (!actor || !target) return undefined;
+    return memberChangeRefusal(actor, target, change) ?? updateMember(tx, targetId, change);
+  });
+}
+
+async function updateMember(
   db: Queryable,
   id: string,
   changes: { role?: Role; active?: boolean },

@@ -41,10 +41,10 @@ export async function writeAuditEntry(db: Queryable, entry: AuditEntryInput): Pr
       entry.via,
       entry.upstreamId ?? null,
       entry.upstreamName ?? null,
-      entry.tool ?? null,
+      withoutNul(entry.tool),
       entry.durationMs,
       entry.outcome,
-      entry.reason ?? null,
+      withoutNul(entry.reason),
     ],
   );
   console.log(
@@ -60,6 +60,11 @@ export async function writeAuditEntry(db: Queryable, entry: AuditEntryInput): Pr
       reason: entry.reason,
     }),
   );
+}
+
+// Tool names and reasons can carry text from the client, and PostgreSQL text cannot hold U+0000.
+function withoutNul(text: string | undefined): string | null {
+  return text?.replaceAll('\u0000', '\uFFFD') ?? null;
 }
 
 /**

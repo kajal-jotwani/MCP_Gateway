@@ -182,6 +182,13 @@ export function chatFailureMessage(error: unknown): string {
   if (error instanceof Anthropic.RateLimitError)
     return 'The Claude API is rate limiting the gateway. Try again shortly.';
   if (error instanceof Anthropic.APIConnectionError) return 'The gateway could not reach the Claude API.';
+  // An error event in the middle of a streamed answer has a type but no HTTP status.
+  if (error instanceof Anthropic.APIError && error.type === 'overloaded_error') {
+    return 'The Claude API is overloaded. Try again shortly.';
+  }
+  if (error instanceof Anthropic.APIError && error.status === undefined) {
+    return 'The Claude API ended the answer with an error. Try again shortly.';
+  }
   if (error instanceof Anthropic.APIError) return `The Claude API returned an error (HTTP ${error.status}).`;
   return 'The chat failed because of an internal gateway error.';
 }

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -11,11 +12,12 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { createApiKey } from '../src/apiKeys.js';
 import { createApp } from '../src/app.js';
 import type { AuditEntry } from '../src/audit.js';
+import { chatFailureMessage } from '../src/chat.js';
 import type { ChatEvent } from '../src/chat.js';
 import type { Database } from '../src/db.js';
 import { createGatewayMcpHandler } from '../src/mcpEndpoint.js';
 import { UpstreamRegistry } from '../src/registry.js';
-import { createMember, ensureFirstAdmin, hashPassword, verifyPassword } from '../src/team.js';
+import { changeMember, createMember, ensureFirstAdmin, hashPassword, verifyPassword } from '../src/team.js';
 import type { Member, Role } from '../src/team.js';
 import { listUpstreamConfigs } from '../src/upstreams.js';
 import { createTestDatabase } from './database.js';
@@ -325,6 +327,21 @@ describe('roles', () => {
     });
     expect((await admin.request('PATCH', `/members/${me.id}`, { role: 'member' })).status).toBe(403);
   });
+
+  it('checks the acting admin when the change is made, not when the request started', async () => {
+    const isolated = await isolatedDatabase();
+    const first = await newMember('admin', isolated);
+    const second = await newMember('admin', isolated);
+    // The second admin's request was signed in as an admin, but the first admin's change committed first.
+    expect(await changeMember(isolated, first.id, second.id, { role: 'member' })).toMatchObject({
+      role: 'member',
+    });
+
+    expect(await changeMember(isolated, second.id, first.id, { role: 'member' })).toBe(
+      'Only admins can change members.',
+    );
+    expect(await changeMember(isolated, first.id, randomUUID(), { role: 'member' })).toBeUndefined();
+  });
 });
 
 describe('API keys', () => {
@@ -489,6 +506,36 @@ describe('MCP endpoint with API keys', () => {
     expect(entries[1]?.durationMs).toBeGreaterThanOrEqual(300);
   });
 
+  it('audits calls whose tool name contains a NUL character, with a valid key or without', async () => {
+    const gateway = await startGateway();
+    const member = await newMember();
+    const client = await mcpClient(gateway, await newKey(db, member));
+
+    const result = await client.callTool({ name: 'list_orders\u0000', arguments: {} });
+    expect(result.isError).toBe(true);
+    const unknownKey = `urk_${'B'.repeat(43)}`;
+    const rejected = await fetch(`${gateway.url}/mcp`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${unknownKey}`,
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'x\u0000' } }),
+    });
+    expect(rejected.status).toBe(401);
+
+    const entries = await auditEntries(gateway);
+    expect(entries.find((entry) => entry.memberId === member.id)).toMatchObject({
+      tool: 'list_orders\uFFFD',
+      outcome: 'rejected',
+    });
+    expect(entries.find((entry) => entry.keyPrefix === unknownKey.slice(4, 12))).toMatchObject({
+      tool: 'x\uFFFD',
+      outcome: 'rejected',
+    });
+  });
+
   it('shows members only their own audit entries', async () => {
     const gateway = await startGateway();
     const member = await newMember();
@@ -642,6 +689,22 @@ describe('upstream servers', () => {
     expect(entry).toMatchObject({ upstreamName: 'WooCommerce', tool: 'list_orders', outcome: 'succeeded' });
   });
 
+  it('audits a call that is still running when its server is removed', async () => {
+    const gateway = await startGateway(isolated);
+    const admin = await adminBrowser(gateway);
+    const [upstream] = (await admin.request('GET', '/upstreams')).body.upstreams as { id: string }[];
+    const member = await newMember('member', isolated);
+    const client = await mcpClient(gateway, await newKey(isolated, member));
+
+    const running = client.callTool({ name: 'sleep', arguments: { ms: 200 } });
+    await eventually(() => expect(gateway.upstream.calls).toHaveLength(1));
+    expect((await admin.request('DELETE', `/upstreams/${upstream!.id}`)).status).toBe(204);
+
+    expect((await running).isError).toBe(true);
+    const [entry] = (await auditEntries(gateway)).filter((e) => e.memberId === member.id);
+    expect(entry).toMatchObject({ upstreamName: 'WooCommerce', tool: 'sleep', outcome: 'failed' });
+  });
+
   it('rejects credentials in URLs, reserved header names, multi-line secrets and taken slugs', async () => {
     const gateway = await startGateway(isolated);
     const admin = await adminBrowser(gateway);
@@ -762,6 +825,36 @@ describe('chat agent', () => {
     expect(await browser.chat('Hello')).toEqual([
       { type: 'error', message: 'The Claude API returned an error (HTTP 500).' },
     ]);
+  });
+
+  it('accepts a conversation at the message limits', async () => {
+    const claude = await startFakeClaude([
+      { blocks: [{ type: 'text', text: 'Done.' }], stopReason: 'end_turn' },
+    ]);
+    const gateway = await startGateway(db, claude.anthropic);
+    const browser = await new Browser(gateway).login((await newMember()).email, PASSWORD);
+    // 49 messages of 20,000 characters, about 1 MB, ten times the limit of the other routes.
+    const messages = Array.from({ length: 49 }, (_, index) => ({
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      text: `${index} `.padEnd(20_000, 'x'),
+    }));
+
+    const { status, text: body } = await browser.requestText('POST', '/chat', { messages });
+
+    expect(status).toBe(200);
+    expect(body).toContain('{"type":"done"}');
+  });
+
+  it('explains Claude API errors that arrive in the middle of an answer', () => {
+    const streamError = (type: 'overloaded_error' | 'api_error') =>
+      new Anthropic.APIError(undefined, { type: 'error', error: { type } }, undefined, undefined, type);
+
+    expect(chatFailureMessage(streamError('overloaded_error'))).toBe(
+      'The Claude API is overloaded. Try again shortly.',
+    );
+    expect(chatFailureMessage(streamError('api_error'))).toBe(
+      'The Claude API ended the answer with an error. Try again shortly.',
+    );
   });
 
   it('requires a signed-in member and a conversation that ends with the member', async () => {

@@ -9,11 +9,12 @@ import { listAuditEntries } from './audit.js';
 import { chatFailureMessage, runChatTurn } from './chat.js';
 import type { ChatEvent, ChatTurn } from './chat.js';
 import type { Database } from './db.js';
-import { auditScopeOf, isAdmin, mayManageKeysOf, memberChangeRefusal } from './permissions.js';
+import { auditScopeOf, isAdmin, mayManageKeysOf } from './permissions.js';
 import type { UpstreamRegistry, UpstreamState } from './registry.js';
 import {
   acceptInvite,
   authenticatePassword,
+  changeMember,
   createInvite,
   createSession,
   deleteInvite,
@@ -25,7 +26,6 @@ import {
   memberForSession,
   MIN_PASSWORD_LENGTH,
   SESSION_TTL_MS,
-  updateMember,
 } from './team.js';
 import type { Member } from './team.js';
 import {
@@ -256,6 +256,9 @@ export function createApiRouter({ db, registry, anthropic, publicUrl }: ApiDeps)
     });
   };
 
+  // A chat history may hold 50 messages of 20,000 characters, about 1 MB, or 3 MB of non-Latin text.
+  // A body parsed here is skipped by the general parser below.
+  router.use('/chat', express.json({ limit: '4mb' }));
   router.use(express.json({ limit: '100kb' }));
   router.use(requireCustomHeader);
   router.use(async (req, res, next) => {
@@ -328,11 +331,10 @@ export function createApiRouter({ db, registry, anthropic, publicUrl }: ApiDeps)
   router.patch('/members/:id', async (req, res) => {
     const actor = signedInMember(res);
     const change = parse(memberPatchBody, req.body);
-    const target = await getMember(db, parseId(req.params.id));
-    if (!target) throw new HttpError(404, 'Not found.');
-    const refusal = memberChangeRefusal(actor, target, change);
-    if (refusal) throw new HttpError(403, refusal);
-    res.json({ member: await updateMember(db, target.id, change) });
+    const member = await changeMember(db, actor.id, parseId(req.params.id), change);
+    if (!member) throw new HttpError(404, 'Not found.');
+    if (typeof member === 'string') throw new HttpError(403, member);
+    res.json({ member });
   });
 
   router.get('/keys', async (req, res) => {
