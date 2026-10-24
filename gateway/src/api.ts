@@ -241,13 +241,7 @@ export function createApiRouter({ db, registry, anthropic, publicUrl }: ApiDeps)
   const router = express.Router();
   const secureCookie = publicUrl.protocol === 'https:';
 
-  // Serialized, so when edits overlap the last sync reads the latest rows.
-  let upstreamsApplied = Promise.resolve();
-  const applyUpstreamChanges = (): Promise<void> => {
-    const next = upstreamsApplied.then(async () => registry.sync(await listUpstreamConfigs(db)));
-    upstreamsApplied = next.catch(() => undefined);
-    return next;
-  };
+  const applyUpstreamChanges = (): Promise<void> => registry.reload(() => listUpstreamConfigs(db));
   const upstreamResponse = (upstream: Upstream) => ({
     upstream: upstreamView(upstream, registry.states().get(upstream.id), true),
   });

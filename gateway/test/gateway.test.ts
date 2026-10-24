@@ -284,4 +284,83 @@ describe('gateway core', () => {
     expect(result.isError).toBe(true);
     expect(text(result)).toBe('the upstream tool failed');
   });
+
+  it('keeps an upstream connected when one call is answered with an HTTP error', async () => {
+    const woo = await startUpstream(['list_orders']);
+    const { client, registry } = await startGateway([upstream('woocommerce', 'WooCommerce', woo.url)]);
+
+    // Over the upstream SDK's 4 MiB request limit, so the upstream answers 413.
+    const oversized = registry.callTool(registry.resolve('list_orders')!, { padding: 'x'.repeat(4_300_000) });
+    await expect(oversized).rejects.toThrow('Upstream "WooCommerce" answered HTTP 413.');
+
+    expect(registry.states().get('id-woocommerce')?.status).toBe('connected');
+    expect(await toolNames(client)).toEqual(['list_orders']);
+    expect(text(await client.callTool({ name: 'list_orders', arguments: {} }))).toBe('list_orders done');
+  });
+
+  it('opens a new change stream after an upstream shuts down gracefully and comes back', async () => {
+    const names = ['list_orders'];
+    const woo = await startUpstream(names);
+    const { registry } = await startGateway([upstream('woocommerce', 'WooCommerce', woo.url)]);
+
+    await woo.close();
+    const restarted = await startUpstream(names, { port: woo.port });
+    // Lets the registry's client see the server end its stream before the next refresh runs.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await registry.refreshAll();
+    names.push('create_product');
+    restarted.notifyToolsChanged();
+
+    await eventually(() =>
+      expect(registry.listTools().map((tool) => tool.name)).toEqual(['create_product', 'list_orders']),
+    );
+  });
+
+  it('keeps a running call alive while it opens a new change stream', async () => {
+    const woo = await startUpstream(['sleep']);
+    const { registry } = await startGateway([upstream('woocommerce', 'WooCommerce', woo.url)]);
+
+    await woo.close();
+    const restarted = await startUpstream(['sleep'], { port: woo.port });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const running = registry.callTool(registry.resolve('sleep')!, { ms: 400 });
+    await eventually(() => expect(restarted.calls).toHaveLength(1));
+    await registry.refreshAll();
+
+    expect(text(await running)).toBe('sleep done');
+  });
+
+  it('stays connected when a restarted upstream refuses a new change stream', async () => {
+    const woo = await startUpstream(['sleep']);
+    const { registry } = await startGateway([upstream('woocommerce', 'WooCommerce', woo.url)]);
+
+    await woo.close();
+    const restarted = await startUpstream(['sleep'], { port: woo.port, maxSubscriptions: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const running = registry.callTool(registry.resolve('sleep')!, { ms: 400 });
+    await eventually(() => expect(restarted.calls).toHaveLength(1));
+    await registry.refreshAll();
+
+    expect(registry.states().get('id-woocommerce')?.status).toBe('connected');
+    expect(text(await running)).toBe('sleep done');
+  });
+
+  it('applies overlapping reloads in order, so the latest rows win', async () => {
+    const woo = await startUpstream(['list_orders']);
+    const config = upstream('woocommerce', 'WooCommerce', woo.url);
+    const registry = new UpstreamRegistry(TIMEOUTS);
+    onCleanup(() => registry.close());
+    const slowRead = Promise.withResolvers<void>();
+
+    // The first read is slow. Applied out of order, it would re-enable the upstream after the second.
+    const first = registry.reload(async () => {
+      await slowRead.promise;
+      return [config];
+    });
+    const second = registry.reload(async () => [{ ...config, enabled: false }]);
+    slowRead.resolve();
+    await Promise.all([first, second]);
+
+    expect(registry.states().get('id-woocommerce')?.status).toBe('disabled');
+  });
 });

@@ -57,9 +57,19 @@ const server = app.listen(config.port, () => {
   console.log(JSON.stringify({ event: 'listening', port: config.port }));
 });
 
+const loadUpstreams = () => listUpstreamConfigs(db);
 // Connecting to upstreams happens after the server is up, so readiness never waits on an upstream.
-await registry.sync(await listUpstreamConfigs(db));
-const refreshTimer = setInterval(() => void registry.refreshAll(), REFRESH_INTERVAL_MS);
+await registry.reload(loadUpstreams);
+// Each refresh also re-reads the upstreams table, because during a rolling update the old pod may
+// handle an admin change that this process would otherwise never see.
+const refreshTimer = setInterval(() => {
+  void registry
+    .reload(loadUpstreams)
+    .catch((error: unknown) => {
+      console.error(JSON.stringify({ event: 'upstream_reload_failed', message: (error as Error).message }));
+    })
+    .then(() => registry.refreshAll());
+}, REFRESH_INTERVAL_MS);
 
 process.on('SIGTERM', () => {
   clearInterval(refreshTimer);

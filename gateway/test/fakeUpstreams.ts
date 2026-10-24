@@ -18,6 +18,8 @@ export interface FakeUpstream {
   url: string;
   port: number;
   calls: ReceivedCall[];
+  /** Tells subscribed clients that the tool list changed. */
+  notifyToolsChanged(): void;
   close(): Promise<void>;
 }
 
@@ -45,14 +47,16 @@ async function closeServer(server: Server): Promise<void> {
 
 /**
  * An MCP server on a real port whose tools echo their name and arguments. `sleep` waits for args.ms,
- * `fail` throws. With a token, requests without `Authorization: Bearer <token>` get 401.
+ * `fail` throws. With a token, requests without `Authorization: Bearer <token>` get 401. Tools are
+ * read from `toolNames` on each request, so changing the array changes what the server lists.
+ * `maxSubscriptions` limits the open change-notification streams.
  */
 export async function startUpstream(
   toolNames: string[],
-  options: { token?: string; port?: number } = {},
+  options: { token?: string; port?: number; maxSubscriptions?: number } = {},
 ): Promise<FakeUpstream> {
   const calls: ReceivedCall[] = [];
-  const handler: McpHttpHandler = createMcpHandler(() => {
+  const createServerForRequest = (): McpServer => {
     const server = new McpServer({ name: 'fake', version: '1.0.0' });
     for (const tool of toolNames) {
       server.registerTool(
@@ -67,6 +71,9 @@ export async function startUpstream(
       );
     }
     return server;
+  };
+  const handler: McpHttpHandler = createMcpHandler(createServerForRequest, {
+    maxSubscriptions: options.maxSubscriptions,
   });
   const node = toNodeHandler(handler);
   const server = createServer((req, res) => {
@@ -85,7 +92,13 @@ export async function startUpstream(
     await closeServer(server);
   };
   onCleanup(close);
-  return { url: `http://127.0.0.1:${port}/mcp`, port, calls, close };
+  return {
+    url: `http://127.0.0.1:${port}/mcp`,
+    port,
+    calls,
+    notifyToolsChanged: () => handler.notify.toolsChanged(),
+    close,
+  };
 }
 
 /** A server that accepts connections and never answers. */

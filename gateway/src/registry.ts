@@ -6,7 +6,7 @@ import {
   SdkHttpError,
   StreamableHTTPClientTransport,
 } from '@modelcontextprotocol/client';
-import type { CallToolResult, Tool } from '@modelcontextprotocol/client';
+import type { CallToolResult, McpSubscription, Tool } from '@modelcontextprotocol/client';
 
 import { exposeToolNames } from './toolNames.js';
 import type { ExposedTool } from './toolNames.js';
@@ -61,6 +61,8 @@ interface Connection {
   checkedAt?: Date;
   tools: Tool[];
   refreshing?: Promise<void>;
+  /** Set when the upstream ended the client's change-notification stream, so the next check opens one. */
+  resubscribe?: boolean;
 }
 
 // Upstream tool definitions and results are untrusted. These caps keep one server from filling the
@@ -80,12 +82,23 @@ export class UpstreamRegistry {
   private routable = new Map<string, RoutedTool>();
   private visible: RoutedTool[] = [];
   private visibleSignature = '[]';
+  private reloading = Promise.resolve();
 
   constructor(private readonly timeouts: RegistryTimeouts) {}
 
   /** Registers a listener that runs whenever the tools clients can see change. */
   onToolsChanged(listener: () => void): void {
     this.toolsChangedListeners.push(listener);
+  }
+
+  /**
+   * Loads the configured upstreams with `load` and syncs them. Reloads run one after another and each
+   * loads when its turn comes, so overlapping admin changes and the refresh loop end on the latest rows.
+   */
+  reload(load: () => Promise<UpstreamConfig[]>): Promise<void> {
+    const next = this.reloading.then(async () => this.sync(await load()));
+    this.reloading = next.catch(() => undefined);
+    return next;
   }
 
   /**
@@ -151,8 +164,8 @@ export class UpstreamRegistry {
 
   /**
    * Calls a tool on its upstream with the upstream's own credential and the call timeout.
-   * Throws UpstreamCallError on timeout, transport failure or an upstream protocol error. A transport
-   * failure marks the upstream unreachable right away instead of at the next refresh.
+   * Throws UpstreamCallError on timeout, transport failure, an HTTP error status or an upstream protocol
+   * error. A transport failure marks the upstream unreachable right away instead of at the next refresh.
    */
   async callTool(
     tool: RoutedTool,
@@ -194,7 +207,8 @@ export class UpstreamRegistry {
   private async check(connection: Connection): Promise<void> {
     const started = Date.now();
     try {
-      connection.client ??= await this.connect(connection);
+      if (!connection.client) connection.client = await this.connect(connection);
+      else if (connection.resubscribe) await this.resubscribe(connection, connection.client);
       const { tools } = await connection.client.listTools(undefined, {
         timeout: this.timeouts.listMs,
         cacheMode: 'refresh',
@@ -229,14 +243,54 @@ export class UpstreamRegistry {
       },
     });
     await client.connect(transport, { timeout: this.timeouts.connectMs });
+    this.watchSubscription(connection, client, client.autoOpenedSubscription);
+    return client;
+  }
+
+  /**
+   * Opens a new change-notification stream on the current client. The client itself is kept, so calls
+   * still running on it are not cut off. Notifications on the new stream reach the same handler.
+   */
+  private async resubscribe(connection: Connection, client: Client): Promise<void> {
+    connection.resubscribe = false;
+    let subscription: McpSubscription;
+    try {
+      subscription = await client.listen({ toolsListChanged: true }, { timeout: this.timeouts.connectMs });
+    } catch (error) {
+      // Without the stream, changes show up at the next refresh instead. The tool list that follows
+      // decides the status, so a refused stream does not hide a working upstream.
+      console.error(
+        JSON.stringify({
+          event: 'upstream_listen_failed',
+          upstream: connection.config.slug,
+          reason: describeFailure(error),
+        }),
+      );
+      return;
+    }
+    // An upstream that no longer sends tool changes ends the stream at once; watching it would reopen
+    // it on every refresh.
+    if (subscription.honoredFilter.toolsListChanged) this.watchSubscription(connection, client, subscription);
+  }
+
+  private watchSubscription(
+    connection: Connection,
+    client: Client,
+    subscription: McpSubscription | undefined,
+  ): void {
     // A dropped change-notification stream usually means the upstream went away. Checking right away
     // marks it unreachable without waiting for the next refresh, or reconnects with a new stream.
-    void client.autoOpenedSubscription?.closed.then((reason) => {
-      if (reason !== 'remote' || connection.client !== client) return;
+    void subscription?.closed.then((reason) => {
+      if (reason === 'local' || connection.client !== client) return;
+      if (reason === 'graceful') {
+        // The upstream ended the stream on purpose, usually because its pod is shutting down. The
+        // replacement may not be up yet, so the next refresh opens the new stream.
+        connection.resubscribe = true;
+        return;
+      }
       this.disconnect(connection);
       void this.refresh(connection);
     });
-    return client;
   }
 
   private toCallError(
@@ -260,6 +314,12 @@ export class UpstreamRegistry {
     if (error instanceof SdkError && error.code === SdkErrorCode.InvalidResult) {
       return new UpstreamCallError('failed', `Upstream "${upstreamName}" returned an invalid result.`);
     }
+    if (error instanceof SdkHttpError) {
+      // The upstream answered, so one request failed, for example a body over its size limit. A check
+      // decides whether the upstream itself is broken, so one caller cannot hide its tools from everyone.
+      if (this.isCurrent(connection)) void this.refresh(connection);
+      return new UpstreamCallError('failed', `Upstream "${upstreamName}" answered HTTP ${error.status}.`);
+    }
     if (connection.client === client && this.isCurrent(connection)) {
       this.disconnect(connection);
       this.setStatus(connection, 'unreachable', describeFailure(error), Date.now());
@@ -277,6 +337,8 @@ export class UpstreamRegistry {
     const { client } = connection;
     if (!client) return;
     connection.client = undefined;
+    // A new client opens its own stream when it connects.
+    connection.resubscribe = false;
     client.close().catch((error: unknown) => {
       console.error(
         JSON.stringify({
