@@ -50,6 +50,22 @@ export interface Upstream {
   error: string | null;
   checkedAt: string | null;
   tools: UpstreamTool[];
+  /** Set on a provisioned store's server, which is changed through its store. */
+  storeId: string | null;
+}
+
+export type StoreStatus = 'provisioning' | 'ready' | 'failed' | 'deleting';
+
+export interface Store {
+  id: string;
+  slug: string;
+  name: string;
+  url: string;
+  ownerId: string;
+  ownerName: string;
+  status: StoreStatus;
+  reason: string | null;
+  createdAt: string;
 }
 
 export type Outcome = 'succeeded' | 'failed' | 'timed_out' | 'rejected';

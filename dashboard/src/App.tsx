@@ -9,6 +9,7 @@ import { ConnectPage } from './ConnectPage';
 import { KeysPage } from './KeysPage';
 import { MembersPage } from './MembersPage';
 import { ServersPage } from './ServersPage';
+import { StoresPage } from './StoresPage';
 import { ErrorText } from './ui';
 
 interface Page {
@@ -20,6 +21,7 @@ interface Page {
 
 const PAGES: Page[] = [
   { path: '/servers', title: 'Servers', render: (member) => <ServersPage member={member} /> },
+  { path: '/stores', title: 'Stores', render: (member) => <StoresPage member={member} /> },
   { path: '/chat', title: 'Chat', render: () => <ChatPage /> },
   { path: '/keys', title: 'API keys', render: (member) => <KeysPage member={member} /> },
   {

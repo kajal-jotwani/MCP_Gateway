@@ -207,7 +207,8 @@ button:disabled {
 }
 
 .badge.connected,
-.badge.succeeded {
+.badge.succeeded,
+.badge.ready {
   color: var(--ok);
 }
 
@@ -217,11 +218,13 @@ button:disabled {
   color: var(--bad);
 }
 
-.badge.timed_out {
+.badge.timed_out,
+.badge.provisioning {
   color: var(--warn);
 }
 
-.badge.disabled {
+.badge.disabled,
+.badge.deleting {
   color: var(--off);
 }
 

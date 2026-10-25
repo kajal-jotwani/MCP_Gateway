@@ -26,8 +26,8 @@ export function ServersPage({ member }: { member: Member }) {
     <>
       <p className="muted">
         Every tool of a connected server is available through the gateway&apos;s one MCP endpoint and in the
-        chat. A tool name gets the server&apos;s slug in front of it only when two servers have a tool with
-        the same name.
+        chat. A tool name gets the server&apos;s slug in front of it when two servers have a tool with the
+        same name, and always for a store created on the Stores page.
       </p>
       <ErrorText message={error} />
       {isAdmin &&
@@ -57,7 +57,10 @@ function describeCredential(upstream: Upstream): string {
   return 'No credential';
 }
 
-function renameReason(tool: UpstreamTool): string {
+function renameReason(tool: UpstreamTool, upstream: Upstream): string {
+  if (upstream.storeId && tool.name === `${upstream.slug}__${tool.originalName}`) {
+    return 'Prefixed with the store’s slug, so the name says which store it acts on.';
+  }
   return tool.name.endsWith(`__${tool.originalName}`)
     ? `Prefixed because another server also has a tool named ${tool.originalName}.`
     : `Renamed from ${tool.originalName} to fit the characters and length MCP clients accept.`;
@@ -115,17 +118,24 @@ function ServerCard({
         </p>
       )}
       <p className="muted">Last checked: {formatTime(upstream.checkedAt)}</p>
+      {upstream.storeId && (
+        <p className="muted">Registered by its store. Delete the store on the Stores page to remove it.</p>
+      )}
       {isAdmin && (
         <div className="row">
-          <button type="button" disabled={busy} onClick={() => setEditing(true)}>
-            Edit
-          </button>
+          {!upstream.storeId && (
+            <button type="button" disabled={busy} onClick={() => setEditing(true)}>
+              Edit
+            </button>
+          )}
           <button type="button" disabled={busy} onClick={() => void setEnabled(!upstream.enabled)}>
             {upstream.enabled ? 'Disable' : 'Enable'}
           </button>
-          <button type="button" className="danger" disabled={busy} onClick={remove}>
-            Remove
-          </button>
+          {!upstream.storeId && (
+            <button type="button" className="danger" disabled={busy} onClick={remove}>
+              Remove
+            </button>
+          )}
           {busy && <span className="muted">Saving and reconnecting…</span>}
         </div>
       )}
@@ -150,7 +160,9 @@ function ServerCard({
                 <tr key={tool.name}>
                   <td>
                     <code>{tool.name}</code>
-                    {tool.name !== tool.originalName && <div className="muted">{renameReason(tool)}</div>}
+                    {tool.name !== tool.originalName && (
+                      <div className="muted">{renameReason(tool, upstream)}</div>
+                    )}
                   </td>
                   <td className="description">{tool.description}</td>
                 </tr>
