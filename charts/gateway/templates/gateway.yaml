@@ -44,6 +44,10 @@ spec:
               value: {{ .Values.seedUpstream.slug | quote }}
             - name: SEED_UPSTREAM_URL
               value: {{ .Values.seedUpstream.url | quote }}
+            - name: STORE_DOMAIN
+              value: {{ required "Set stores.domain to the domain stores are served under, such as example.com." .Values.stores.domain | quote }}
+            - name: MAX_STORES_PER_MEMBER
+              value: {{ .Values.stores.maxPerMember | quote }}
           securityContext:
             {{- include "gateway.restrictedContainer" . | nindent 12 }}
           # The gateway waits up to a minute for PostgreSQL and runs migrations before it listens.

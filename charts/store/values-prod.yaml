@@ -22,3 +22,10 @@ resources:
   wordpress:
     requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: '1', memory: 1Gi }
+
+# Room for the larger WordPress and MariaDB limits above.
+quota:
+  requests: { cpu: '1', memory: 1536Mi, storage: 6Gi }
+  limits: { cpu: '5', memory: 4Gi }
+  pods: 8
+  persistentVolumeClaims: 3

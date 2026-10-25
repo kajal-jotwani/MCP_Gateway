@@ -46,3 +46,17 @@ resources:
   wooMcp:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 500m, memory: 256Mi }
+
+# Caps for the whole namespace, so one store cannot starve the others on a shared node. They cover
+# every pod above at once plus a second woo-mcp pod during a rolling update.
+quota:
+  requests: { cpu: '1', memory: 1536Mi, storage: 6Gi }
+  limits: { cpu: '5', memory: 3Gi }
+  pods: 8
+  persistentVolumeClaims: 3
+
+# Applied to any container that sets no requests or limits of its own, and the most one may ask for.
+limitRange:
+  defaultRequest: { cpu: 50m, memory: 64Mi }
+  default: { cpu: 250m, memory: 256Mi }
+  max: { cpu: '1', memory: 1Gi }

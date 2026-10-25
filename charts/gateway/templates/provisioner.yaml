@@ -1,0 +1,218 @@
+{{- $component := dict "root" $ "name" "provisioner" }}
+{{- $serviceAccount := printf "%s-provisioner" .Release.Name }}
+# The only workload with Kubernetes API rights. The gateway, which faces the internet, has none: it
+# writes store requests to PostgreSQL, and the provisioner carries them out.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $serviceAccount }}
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+---
+# Cluster-wide, the provisioner may only create and delete namespaces and bind the store role below
+# inside them. It gets no rights in any existing namespace, so it cannot read other Secrets.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Namespace }}-store-provisioner
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "create", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["create"]
+  # Lets it bind the store role without holding those rights cluster-wide itself.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["bind"]
+    resourceNames: ["{{ .Release.Namespace }}-store"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Namespace }}-store-provisioner
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Namespace }}-store-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: {{ $serviceAccount }}
+    namespace: {{ .Release.Namespace }}
+---
+# What helm needs to install the store chart. The provisioner binds it in each store namespace it
+# creates, with a RoleBinding there, so these rights hold in store namespaces only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Namespace }}-store
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets", "services", "persistentvolumeclaims", "resourcequotas", "limitranges"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read-only, for helm --wait to follow rollouts and the setup Job.
+  - apiGroups: ["", "apps"]
+    resources: ["pods", "replicasets", "events"]
+    verbs: ["get", "list", "watch"]
+---
+# Every change the provisioner's account makes must be to a namespace labelled as the provisioner's,
+# or to an object inside one, such as the RoleBinding that grants it the store role there. A namespace is checked as it is created or as it was before a delete,
+# so the account cannot take over an existing namespace such as kube-system by labelling it.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ .Release.Namespace }}-store-provisioner
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["*"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["*"]
+  matchConditions:
+    - name: provisioner-only
+      expression: request.userInfo.username == 'system:serviceaccount:{{ .Release.Namespace }}:{{ $serviceAccount }}'
+  variables:
+    - name: targetNamespace
+      expression: >-
+        request.resource.resource == 'namespaces'
+        ? (request.operation == 'CREATE' ? object : oldObject)
+        : dyn(namespaceObject)
+  validations:
+    - expression: >-
+        variables.targetNamespace != null
+        && has(variables.targetNamespace.metadata.labels)
+        && 'app.kubernetes.io/managed-by' in variables.targetNamespace.metadata.labels
+        && variables.targetNamespace.metadata.labels['app.kubernetes.io/managed-by'] == 'urumi-provisioner'
+      message: The store provisioner may only change namespaces it created.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ .Release.Namespace }}-store-provisioner
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+spec:
+  policyName: {{ .Release.Namespace }}-store-provisioner
+  validationActions: ["Deny"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: store-values
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+data:
+  store-values.yaml: |
+    {{- toYaml .Values.stores.chartValues | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provisioner
+  labels:
+    {{- include "gateway.labels" $component | nindent 4 }}
+spec:
+  replicas: 1
+  # Two provisioners would run helm on the same store at once, so the old pod stops first.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gateway.selectorLabels" $component | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gateway.labels" $component | nindent 8 }}
+      annotations:
+        checksum/store-values: {{ toYaml .Values.stores.chartValues | sha256sum }}
+    spec:
+      serviceAccountName: {{ $serviceAccount }}
+      securityContext:
+        {{- include "gateway.nodePodSecurity" . | nindent 8 }}
+      containers:
+        - name: provisioner
+          image: {{ .Values.images.gateway }}
+          command: ["node", "gateway/dist/provisionerMain.js"]
+          ports:
+            - name: health
+              containerPort: 8081
+          env:
+            - name: PGHOST
+              value: postgres
+            - name: PGUSER
+              value: gateway
+            - name: PGDATABASE
+              value: gateway
+            {{- include "gateway.secretEnv" (list .Values.secrets.gateway "PGPASSWORD" "POSTGRES_PASSWORD") | nindent 12 }}
+            - name: GATEWAY_NAMESPACE
+              value: {{ .Release.Namespace }}
+            - name: PROVISIONER_SERVICE_ACCOUNT
+              value: {{ $serviceAccount }}
+            - name: STORE_ROLE
+              value: {{ .Release.Namespace }}-store
+            - name: STORE_CHART_PATH
+              value: /app/charts/store
+            - name: STORE_VALUES_FILE
+              value: /config/store-values.yaml
+            - name: PROVISION_TIMEOUT_MINUTES
+              value: {{ .Values.stores.provisionTimeoutMinutes | quote }}
+            # Node trusts the API server's certificate through the service account's CA.
+            - name: NODE_EXTRA_CA_CERTS
+              value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            # helm keeps its cache and config under HOME; the root filesystem is read-only.
+            - name: HOME
+              value: /tmp
+          securityContext:
+            {{- include "gateway.restrictedContainer" . | nindent 12 }}
+          # /healthz answers 200 while passes over the stores table keep finishing, so a provisioner
+          # that lost its database or hangs is restarted. Store installs do not affect it.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources.provisioner | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: store-values
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: store-values
+          configMap:
+            name: store-values

@@ -1,5 +1,5 @@
-# Every pod in the namespace refuses incoming traffic unless a policy below allows it. Egress is
-# not restricted: WordPress and the setup Job download plugins, and woo-mcp only calls WordPress.
+# Every pod in the namespace refuses incoming traffic unless a policy below allows it. Only woo-mcp's
+# egress is restricted: WordPress and the setup Job download plugins.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -33,6 +33,39 @@ spec:
               app.kubernetes.io/name: gateway
       ports:
         - port: mcp
+---
+# woo-mcp may call this store's WordPress and DNS, nothing else: not another store's WordPress or
+# database, not the gateway's, and not the internet.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: woo-mcp-egress
+  labels:
+    {{- include "store.labels" (dict "root" $ "name" "woo-mcp") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "store.selectorLabels" (dict "root" $ "name" "woo-mcp") | nindent 6 }}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "store.selectorLabels" (dict "root" $ "name" "wordpress") | nindent 14 }}
+      ports:
+        - port: http
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
 ---
 # Browsers reach WordPress through the Ingress controller; woo-mcp calls its REST API.
 apiVersion: networking.k8s.io/v1

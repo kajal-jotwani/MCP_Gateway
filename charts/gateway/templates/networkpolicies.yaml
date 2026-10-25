@@ -30,8 +30,8 @@ spec:
       ports:
         - port: http
 ---
-# The database and the bundled upstreams answer the gateway only, so nothing in the cluster can
-# reach them around the gateway's API-key checks and audit.
+# The database answers the gateway and the provisioner only, and the bundled upstreams the gateway
+# only, so nothing in the cluster can reach them around the gateway's API-key checks and audit.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -48,6 +48,9 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "gateway.selectorLabels" (dict "root" $ "name" "gateway") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "gateway.selectorLabels" (dict "root" $ "name" "provisioner") | nindent 14 }}
       ports:
         - port: postgres
 ---

@@ -6,10 +6,28 @@ publicUrl: ''
 images:
   # Built and pushed to GHCR as described in the README. The packages must be public, because the
   # chart uses no image pull secret.
-  gateway: ghcr.io/kajal-jotwani/gateway:0.1.0
+  gateway: ghcr.io/kajal-jotwani/gateway:0.2.0
   notesMcp: ghcr.io/kajal-jotwani/notes-mcp:0.1.0
   everything: ghcr.io/kajal-jotwani/everything:2.0.0
 
 storage:
   # The k3s default, as on k3d. Stated here so the production choice is visible.
   className: local-path
+
+stores:
+  # Stores are served at store-<slug>.<domain>, so the domain needs a wildcard A record (*.<domain>)
+  # pointing to the VPS, or use <vps-ip>.sslip.io, which resolves every subdomain to that IP.
+  domain: ''
+  chartValues:
+    images:
+      wooMcp: ghcr.io/kajal-jotwani/woo-mcp:0.1.0
+    # The prod limits of ../store/values-prod.yaml, which provisioned stores do not read.
+    resources:
+      mariadb:
+        requests: { cpu: 100m, memory: 384Mi }
+        limits: { cpu: '1', memory: 1Gi }
+      wordpress:
+        requests: { cpu: 100m, memory: 256Mi }
+        limits: { cpu: '1', memory: 1Gi }
+    quota:
+      limits: { cpu: '5', memory: 4Gi }

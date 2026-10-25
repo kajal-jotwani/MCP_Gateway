@@ -17,8 +17,20 @@ seedUpstream:
   slug: woocommerce
   url: http://woo-mcp.store.svc.cluster.local:3000/mcp
 
+# Stores members create from the dashboard. The provisioner installs ../store into a namespace
+# store-<slug> per store and registers its woo-mcp as an upstream.
+stores:
+  # Each store is served at store-<slug>.<domain>. *.localtest.me resolves to 127.0.0.1.
+  domain: localtest.me
+  maxPerMember: 3
+  provisionTimeoutMinutes: 15
+  # Store chart values shared by every provisioned store, such as the woo-mcp image. Each store's URL,
+  # title and the gateway namespace are set by the provisioner.
+  chartValues: {}
+
 images:
-  gateway: urumi/gateway:0.1.0
+  # The gateway image also runs the provisioner, with helm and the store chart inside.
+  gateway: urumi/gateway:0.2.0
   postgres: postgres:18.6-alpine3.24
   notesMcp: urumi/notes-mcp:0.1.0
   everything: urumi/everything:2.0.0
@@ -36,6 +48,9 @@ resources:
   gateway:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: '1', memory: 512Mi }
+  provisioner:
+    requests: { cpu: 50m, memory: 96Mi }
+    limits: { cpu: '1', memory: 384Mi }
   postgres:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: '1', memory: 512Mi }

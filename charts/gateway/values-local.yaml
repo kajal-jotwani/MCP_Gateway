@@ -3,6 +3,12 @@ publicUrl: http://app.localtest.me
 
 images:
   # Built locally and loaded with `k3d image import`.
-  gateway: urumi/gateway:0.1.0
+  gateway: urumi/gateway:0.2.0
   notesMcp: urumi/notes-mcp:0.1.0
   everything: urumi/everything:2.0.0
+
+stores:
+  domain: localtest.me
+  chartValues:
+    images:
+      wooMcp: urumi/woo-mcp:0.1.0
