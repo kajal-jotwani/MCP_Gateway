@@ -287,6 +287,12 @@ The charts serve plain HTTP. On a public VPS, passwords and API keys then cross 
   kubectl -n gateway exec postgres-0 -- pg_dump -U gateway gateway > gateway-backup.sql
   ```
 
+- `helm rollback` does not undo a WooCommerce version change. The setup Job runs after install and upgrade but not after a rollback, and WooCommerce has already migrated its tables. To go back, run `helm upgrade` with the previous `woocommerceVersion` (the Job reinstalls that version), then restore the dump. This restore command has not been tested:
+
+  ```sh
+  kubectl -n store exec -i mariadb-0 -- sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" wordpress' < store-backup.sql
+  ```
+
 ## Development
 
 The four Node packages (`woo-mcp`, `notes-mcp`, `gateway`, `dashboard`) are npm workspaces. With Node 24:
