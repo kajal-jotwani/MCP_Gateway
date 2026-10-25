@@ -14,6 +14,7 @@ Status: approved on 2026-10-23 and implemented. Statements marked **Verified** w
 | PostgreSQL | StatefulSet, PVC, namespace `gateway` | Members, sessions, invites, API keys, upstreams, audit entries |
 | `server-everything` | Deployment, ClusterIP Service, namespace `gateway` | Second upstream: the official MCP reference server |
 | `notes-mcp` | Deployment, ClusterIP Service, namespace `gateway` | Third upstream, written here: a small notes server that requires a bearer token |
+| Store provisioner | Deployment (1 replica, gateway image), namespace `gateway`, its own service account | Creates and deletes the stores members request on the Stores page: a namespace `store-<slug>` per store with the store chart installed, and its woo-mcp registered as an upstream |
 
 The dashboard (`dashboard/`, React + Vite) is built into the gateway image and served by the gateway from the same origin as `/api` and `/mcp`. One origin means no CORS and one Ingress host.
 
@@ -36,7 +37,7 @@ docs/              design.md, threat-model.md
 
 `notes-mcp/` and `everything/` are additions to the layout in CLAUDE.md, needed for G6.
 
-Two charts instead of one: the store chart is the unit that the multi-store bonus would install per store, and the gateway does not need to be reinstalled when a store changes. Each chart has `values.yaml`, `values-local.yaml` and `values-prod.yaml`.
+Two charts instead of one: the store chart is the unit that the provisioner installs once per store, and the gateway does not need to be reinstalled when a store changes. Each chart has `values.yaml`, `values-local.yaml` and `values-prod.yaml`.
 
 ## Decisions
 
@@ -121,6 +122,7 @@ Cursor's 60-character limit is the tightest of these. `team-gateway` is 12 chara
 - When two or more enabled upstreams expose the same name, every one of those colliding tools is renamed to `<slug>__<name>`, for example `store__search` and `notes__search`. Tools that do not collide keep their plain names. Renaming all sides, instead of letting the first-registered server keep the plain name, means the result does not depend on registration order, and the model is never handed one plain `search` that silently means one particular server.
 - Collisions are computed over every enabled upstream using its last known tool list, including upstreams that are currently Unreachable. So a pod dying (D8) does not rename the other server's tools back and forth.
 - Maximum exposed length is 48 characters. That leaves room for Cursor's 60 with a config key of up to 12 characters. A longer name is cut to 41 characters plus `_` plus the first 6 hex characters of the SHA-256 of the full name, so it stays unique and stable.
+- Tools of a provisioned store's upstream are always `<slug>__<name>`, such as `delhi__list_orders`, even without a collision, because the multi-store bonus requires that a tool name says which store it acts on. This does not change the rule for other servers: Notes and Everything keep plain names. The original store is not a provisioned one, so its tools are plain until a provisioned store exists; then they collide with the store's base names and become `woocommerce__list_orders` under the rule above. With several stores, every store tool therefore names its store.
 - Any duplicate left after these steps (for example an upstream tool literally named `notes__search`, or two names that sanitize to the same string) gets the same hash suffix. A name that is still ambiguous after that is left out, so a call can never reach the wrong upstream.
 
 Tradeoff: plain names are what clients and the model see most of the time, and they read naturally in prompts and in the chat UI. The cost is that adding an upstream with an overlapping name renames the existing tool for every client. The gateway sends `list_changed` when that happens, and the dashboard shows which tools are renamed and why, so the admin sees the effect before and after adding a server. The alternative, prefixing every tool always, keeps names stable but puts a server name on every tool, which Kajal chose against.
@@ -287,6 +289,43 @@ The gateway process does hold state in memory: the upstream clients, the tool ca
 
 Auth and audit would still be correct, because they read and write PostgreSQL on every request. The chart runs one replica; during a rolling update the old and new pods overlap for a few seconds, which the periodic re-read covers. Fixing the above would mean `LISTEN/NOTIFY` for admin changes and storing status in PostgreSQL; that is the scaling extension and out of scope.
 
+### Multi-store provisioning
+
+The bonus: members create and delete stores from the dashboard. Each store is provisioned in its own namespace, with its own database, Secrets, volumes and Ingress host, and its own woo-mcp registered in the gateway without manual steps.
+
+Options considered for who runs Helm:
+
+- The gateway calls Helm or the Kubernetes API itself. Simplest, but the internet-facing process would then hold rights to create namespaces, Secrets and workloads.
+- A custom resource and an operator that reconciles it. The most Kubernetes-native shape, but it needs a CRD, a controller framework and a second source of truth next to PostgreSQL, where ownership, limits and the dashboard's state already live.
+- **Decision:** a separate provisioner Deployment in the `gateway` namespace, built from the gateway image (which also contains `helm` 4.3.1 and `charts/store`). The gateway only writes rows to a `stores` table. The provisioner reads the table every 5 seconds and carries out the rows in the `provisioning` and `deleting` states. The gateway keeps no Kubernetes rights and mounts no token; the provisioner has no Ingress and no route from outside.
+
+Creating a store (`POST /api/stores` with a name):
+
+1. The gateway derives a slug from the name (a DNS label of 2 to 16 characters), checks that no store or server uses it, checks the member's limit (`stores.maxPerMember`, default 3, counted under a row lock on the member so two requests cannot both pass) and inserts the row as `provisioning`, with URL `http://store-<slug>.<stores.domain>`. Sending the same name again returns the member's existing store with 200 instead of a second one, so a client can retry a request whose response it lost.
+2. The provisioner creates the namespace `store-<slug>` with the labels `app.kubernetes.io/managed-by: urumi-provisioner` and `urumi.dev/store-id: <id>`, a RoleBinding there that grants it the store role, and the Secret `store-credentials` with freshly generated values (`crypto.randomBytes`), the same keys an operator creates for the original store.
+3. It runs `helm upgrade --install store charts/store -n store-<slug> --values <shared values> --values - --wait=watcher --timeout <time left>`. The shared values come from `stores.chartValues` in the gateway chart (for example the woo-mcp image); the per-store values (URL, title, the gateway's namespace) go through stdin, so a store name needs no escaping. Helm waits for the workloads and the setup Job, which installs WordPress and WooCommerce as for the original store.
+4. When Helm succeeds, one transaction marks the store `ready` and inserts its upstream (`http://woo-mcp.store-<slug>.svc.cluster.local:3000/mcp`, `upstreams.store_id` set). The gateway's 15-second reload connects it, lists its tools and sends `list_changed`.
+
+Several stores provision at once, up to 4 Helm installs in parallel; more wait for a slot.
+
+Deleting a store: the gateway marks the row `deleting` and deletes its upstream in the same transaction, then reloads the registry, so the store's tools are gone from clients before anything in Kubernetes changes. The provisioner cancels an install still running for that store (the Helm process is killed), deletes the namespace with foreground propagation, and removes the row once the namespace is gone. Deleting the namespace removes the release, the Secrets and the claims, and `local-path` then deletes the volumes. A namespace without the store's id label is never deleted: the row is removed and the namespace left alone. A store's upstream cannot be edited or removed on the Servers page (409), only enabled or disabled; it goes with its store.
+
+Guardrails:
+
+- The store chart has a ResourceQuota (requests 1 CPU and 1.5 GiB, limits 5 CPU and 3 GiB, 8 pods, 3 claims, 6 GiB of storage, no LoadBalancer or NodePort Services) sized for every pod at once plus a second woo-mcp pod during a rolling update, and a LimitRange with defaults and a per-container maximum of 1 CPU and 1 GiB. Both apply to the original store too.
+- At most `stores.maxPerMember` stores per member (3).
+- A provisioning timeout, `stores.provisionTimeoutMinutes` (15). It counts from when the attempt started (`stores.attempt_started_at`), so a provisioner restart does not reset it, and Helm's own `--timeout` is the time left. A store past it is marked `failed` with "Provisioning did not finish within 15 minutes."
+
+Recovery: every step is safe to repeat, and each pass starts from what PostgreSQL and the cluster say, so a provisioner that restarts mid-store resumes it on its first pass. The namespace, RoleBinding and Secret are created only if missing (an existing Secret is kept, so the store's database password still matches its volume). A release that is not `deployed` (`pending-install` after a killed Helm, or `failed` from an earlier attempt) blocks `upgrade --install`, so it is uninstalled first; that keeps the namespace, the Secret and the claims. A release that is `deployed` finished before the restart, so the store is only registered. A Helm failure fails the store with Helm's first error line ("The store chart failed to install: ..."); a Kubernetes API or database error is retried on the next pass until the timeout. **Retry** on a failed store starts a new attempt (`attempt + 1`, new start time). Every write of a result checks the attempt number, so an old attempt cannot overwrite a newer state. The Deployment uses the `Recreate` strategy, so two provisioners never run Helm on one store at once.
+
+Permissions: the provisioner's ClusterRole lets it get, create and delete namespaces, create RoleBindings, and `bind` one ClusterRole, `<gateway-namespace>-store`, which holds what Helm needs for the store chart (ConfigMaps, Secrets, Services, claims, quotas, Deployments, StatefulSets, Jobs, Ingresses, NetworkPolicies, and read access to Pods, ReplicaSets and events). It holds the store role only through the RoleBinding it creates in each store namespace, so it has no rights in existing namespaces and cannot read their Secrets. A ValidatingAdmissionPolicy denies any create, update or delete by the provisioner's account unless the target namespace carries the managed-by label (for a namespace itself: as created, or as it was before a delete), so it cannot create a RoleBinding in `kube-system` or delete a namespace it did not create.
+
+Isolation: the store chart's NetworkPolicies already admit MariaDB connections only from the same namespace's WordPress and setup Job, and WordPress connections only from the Ingress controller and the same namespace's woo-mcp. An egress policy now limits woo-mcp to its own WordPress and DNS, so one store's MCP server cannot reach another store's database or WordPress, the gateway's database, or the internet. WordPress and the setup Job keep open egress, because they download WooCommerce.
+
+**Verified (multi-store, k3s 1.36.5 test cluster, Helm 4.3.1):** two stores created at the same time both reached Ready, after the provisioner pod was deleted while both Helm installs were running (one release was left `pending-install`, the other `failed`; both were uninstalled and installed again, and the Secrets kept); their tools were listed as `delhi__*` and `pune__*`, with the original store's tools renamed `woocommerce__*`; each storefront answered on its own Ingress host. From Delhi's woo-mcp, Delhi's WordPress was reachable and Pune's WordPress and MariaDB, the original store, PostgreSQL, the gateway, Traefik and an internet address were refused; Pune's WordPress could not reach Delhi's MariaDB, WordPress or woo-mcp, and the provisioner could not reach woo-mcp. Deleting Delhi removed its upstream in the same request and its namespace and both volumes within 20 seconds. With a 1-minute timeout and a missing woo-mcp image, a store failed with the timeout reason after 60 seconds, and Retry brought it to Ready. A fourth store for one member was refused. The provisioner's account was refused a Secret in `kube-system`, deleting the `store` namespace, creating an unlabelled namespace and listing Secrets in `kube-system` and `store`. The test cluster cannot download WooCommerce (wordpress.org is blocked there), so these runs used a copy of the setup script without the WooCommerce steps.
+
+**To verify** on Kajal's Mac: the same flow with the real setup Job (WooCommerce download), and the chat agent comparing today's orders across two stores, then a delete removing that store's tools.
+
 ## Request flows
 
 External client `tools/call`:
@@ -307,7 +346,8 @@ members        id, email (unique), name, role (admin|member), password_hash, act
 sessions       id_hash, member_id, expires_at
 invites        id, token_hash (unique), email, role, created_by, expires_at
 api_keys       id, member_id, key_hash (unique), display_prefix, name, created_by, created_at, revoked_at, last_used_at
-upstreams      id, slug (unique), name, url, auth_type (none|bearer|header), auth_header_name, auth_secret, enabled, created_at, updated_at
+upstreams      id, slug (unique), name, url, auth_type (none|bearer|header), auth_header_name, auth_secret, enabled, store_id (nullable, unique, deleted with its store), created_at, updated_at
+stores         id, slug (unique, DNS label), name, url, owner_id, status (provisioning|ready|failed|deleting), reason, attempt, attempt_started_at, created_at, updated_at
 bootstrap      action, done_at
 audit_entries  id, at, member_id (nullable), key_prefix (nullable), via (mcp|chat), upstream_id (nullable, no foreign key), upstream_name, tool, duration_ms, outcome (succeeded|failed|timed_out|rejected), reason
 ```
@@ -321,7 +361,8 @@ The WooCommerce upstream is inserted on the gateway's first start from chart val
 | Exposed publicly (Ingress) | Internal only (ClusterIP + NetworkPolicy) |
 |---|---|
 | `store.<domain>`: WordPress | woo-mcp, MariaDB |
-| `app.<domain>`: gateway (dashboard, `/api`, `/mcp`) | PostgreSQL, notes-mcp, server-everything |
+| `app.<domain>`: gateway (dashboard, `/api`, `/mcp`) | PostgreSQL, notes-mcp, server-everything, the store provisioner (no Service) |
+| `store-<slug>.<domain>`: WordPress of each provisioned store | its woo-mcp and MariaDB |
 
 Every long-running workload has requests and limits and readiness and liveness probes that check something real (the setup Job has requests and limits instead of probes, and is bounded by `backoffLimit: 2` and `activeDeadlineSeconds: 900`):
 
@@ -334,6 +375,7 @@ Every long-running workload has requests and limits and readiness and liveness p
 | PostgreSQL | `pg_isready` | `pg_isready` |
 | notes-mcp | `/healthz` | same |
 | server-everything | TCP 3001 (it has no health route, and `GET /mcp` without a session is a 400) | same |
+| store provisioner | `/healthz`: a pass over the stores table finished in the last 60 s (database reachable, loop not stuck) | same |
 
 Every long-running container runs as a non-root user with all capabilities dropped and privilege escalation off (**Verified (stage 7)** from `/proc/1/status` in each pod: uid 33 WordPress, 999 MariaDB, 70 PostgreSQL, 1000 for the Node images, no effective capabilities). WordPress runs Apache as `www-data` on port 80; the pod sets the namespaced sysctl `net.ipv4.ip_unprivileged_port_start=0` so no root or `NET_BIND_SERVICE` is needed. The one exception is a short init container in the WordPress pod and the setup Job that runs as root with only `CHOWN`, to hand the freshly created volume roots to `www-data`: `local-path` volumes ignore `fsGroup`.
 
@@ -361,15 +403,16 @@ Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and ever
 | T2 | `urk_` keys, SHA-256, revocation checked on every call |
 | T4, D9 | `writeAuditEntry` in the single tool-call path, audit page in the dashboard |
 | C1, C2, C3 | Claude Messages API loop in the gateway using the same path, tool calls streamed to the UI, key in a Secret |
+| Multi-store bonus | `stores` table and Stores page; provisioner running Helm per namespace `store-<slug>`; RBAC bound per store namespace plus an admission policy; quota, LimitRange, per-member limit and timeout; woo-mcp egress policy; store tools always `<slug>__<tool>` |
 
 ## Production changes
 
 `values-prod.yaml` in each chart changes only:
 
-- Hostnames: `store.url` and `publicUrl`, real names whose DNS A records point to the VPS (`sslip.io` names work without a domain). They are empty in the file, because no VPS was set up, and the charts refuse to render without them.
+- Hostnames: `store.url` and `publicUrl`, real names whose DNS A records point to the VPS (`sslip.io` names work without a domain), and `stores.domain`, under which provisioned stores are served as `store-<slug>.<domain>`, which needs a wildcard record. They are empty in the file, because no VPS was set up, and the charts refuse to render without them.
 - Ingress: same Traefik class; TLS with cert-manager and Let's Encrypt is an optional extension.
 - Storage class: k3s `local-path` (the default on both k3d and k3s; set explicitly so the choice is visible).
-- Images: public GHCR packages (`ghcr.io/kajal-jotwani/...`, same tags) instead of locally imported images, so the charts need no image pull secret.
+- Images: public GHCR packages (`ghcr.io/kajal-jotwani/...`, same tags) instead of locally imported images, so the charts need no image pull secret. Provisioned stores get the GHCR woo-mcp image and the prod resource limits through `stores.chartValues`.
 - Resources: higher memory limits for WordPress and MariaDB (1 GiB each) and a higher MariaDB memory request (384 MiB).
 - Secrets: created with the same `kubectl` commands on the VPS, with new random values.
 

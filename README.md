@@ -7,14 +7,15 @@ What runs in the cluster:
 | Namespace | Workloads | Public URL |
 |---|---|---|
 | `store` | WordPress + WooCommerce, MariaDB, setup Job, `woo-mcp` (the WooCommerce MCP server in this repo) | `store.<domain>` (storefront and wp-admin) |
-| `gateway` | gateway (backend, MCP endpoint, chat agent, dashboard), PostgreSQL, `notes-mcp`, `server-everything` | `app.<domain>` (dashboard, `/api`, `/mcp`) |
+| `gateway` | gateway (backend, MCP endpoint, chat agent, dashboard), store provisioner, PostgreSQL, `notes-mcp`, `server-everything` | `app.<domain>` (dashboard, `/api`, `/mcp`) |
+| `store-<slug>`, one per store created on the Stores page | the same as `store`, installed by the provisioner from the same chart | `store-<slug>.<domain>` |
 
 `woo-mcp`, the databases and the two extra upstreams have no Ingress and accept traffic only from their own clients (NetworkPolicies). How it works and why: [docs/design.md](docs/design.md). Risks and limits: [docs/threat-model.md](docs/threat-model.md).
 
-Optional work: the multi-store bonus was not attempted. Of the other stand-out items, these are done in part:
+Optional work: multi-store provisioning is implemented. Members create and delete stores on the dashboard's Stores page, and each store is registered in the gateway on its own; see [Create and delete stores](#create-and-delete-stores) and "Multi-store provisioning" in [docs/design.md](docs/design.md). Of the other stand-out items, these are done in part:
 
 - Upgrades and rollback: Helm upgrade with automatic rollback, tested with a bad image tag; see [Upgrades, rollback and backups](#upgrades-rollback-and-backups) and "Upgrade and rollback" in [docs/design.md](docs/design.md).
-- Security hardening: default-deny ingress NetworkPolicies in both namespaces, and non-root containers with all capabilities dropped (one init container runs as root with only `CHOWN`). No component uses the Kubernetes API, so the charts create no RBAC, and the gateway, woo-mcp and upstream pods mount no service account token. Not done: an SSRF guard for upstream URLs and encryption of upstream credentials at rest ([docs/threat-model.md](docs/threat-model.md)).
+- Security hardening: default-deny ingress NetworkPolicies in both namespaces, and non-root containers with all capabilities dropped (one init container runs as root with only `CHOWN`). Only the store provisioner uses the Kubernetes API. Its RBAC grants nothing in existing namespaces, and an admission policy limits it to the namespaces it created. The gateway, woo-mcp and upstream pods mount no service account token. Not done: an SSRF guard for upstream URLs and encryption of upstream credentials at rest ([docs/threat-model.md](docs/threat-model.md)).
 - Observability: the Servers page shows why an upstream is Unreachable, and each audit entry gives the reason a call failed or was rejected. There are no metrics.
 - Production-like deployment: `values-prod.yaml` and the [VPS setup](#vps-setup-k3s) steps, rehearsed on a k3s test cluster but not deployed to a public VPS.
 
@@ -46,8 +47,8 @@ This maps port 80 on your machine to the cluster's Traefik Ingress controller. k
 docker build -f woo-mcp/Dockerfile -t urumi/woo-mcp:0.1.0 .
 docker build -f notes-mcp/Dockerfile -t urumi/notes-mcp:0.1.0 .
 docker build -f everything/Dockerfile -t urumi/everything:2.0.0 .
-docker build -f gateway/Dockerfile -t urumi/gateway:0.1.0 .
-k3d image import -c urumi urumi/woo-mcp:0.1.0 urumi/notes-mcp:0.1.0 urumi/everything:2.0.0 urumi/gateway:0.1.0
+docker build -f gateway/Dockerfile -t urumi/gateway:0.2.0 .
+k3d image import -c urumi urumi/woo-mcp:0.1.0 urumi/notes-mcp:0.1.0 urumi/everything:2.0.0 urumi/gateway:0.2.0
 ```
 
 The gateway image also contains the built dashboard.
@@ -204,6 +205,42 @@ Each tool call is shown under the answer with its arguments and result, and is r
 
 Add Notes a second time on the Servers page, with slug `notes2`, the same URL and token. All three notes tools on both entries become `notes__...` and `notes2__...`, and calls go to the right one. Remove the copy and the plain names come back.
 
+### Create and delete stores
+
+On the **Stores** page, enter a name such as `Delhi` and click **Create store**. The store appears as Provisioning. The provisioner creates the namespace `store-delhi` with its own generated Secret, then installs the store chart there: MariaDB, WordPress, the setup Job and woo-mcp, each with its own volumes, plus an Ingress for `http://store-delhi.localtest.me`. Within a few minutes the store shows Ready. The gateway picks up its woo-mcp within 15 seconds, and its tools appear on the Servers page as `delhi__list_orders`, `delhi__create_product` and so on. Several stores can be created at once. Creating a store with a name you already used returns that store instead of starting a second one.
+
+Store tools always carry the store's slug. While any store exists, the original store's tools collide with them and become `woocommerce__list_orders` and so on, under the collision rule.
+
+Each member can have up to 3 stores (`stores.maxPerMember`). A store that is not Ready within 15 minutes (`stores.provisionTimeoutMinutes`) is marked Failed with the reason, and **Retry** starts a new attempt. If the provisioner restarts in the middle, the next one resumes the store: a half-installed release is removed and installed again, and the Secret and volumes are kept.
+
+**Delete** removes the store's tools from every client at once. Then the provisioner deletes the namespace, which removes the release, the volumes and the Secrets, and the store disappears from the list. Members can delete their own stores, and admins can delete any store.
+
+To compare two stores, create `Delhi` and `Pune`, place an order on each storefront, and ask the chat agent: "Compare today's orders in the Delhi and Pune stores." It calls `delhi__list_orders` and `pune__list_orders`. Delete `Pune`, and its tools are gone from the chat agent and from connected clients.
+
+To sign in to a store's wp-admin as `admin`, read its generated password:
+
+```sh
+kubectl -n store-delhi get secret store-credentials -o jsonpath='{.data.WORDPRESS_ADMIN_PASSWORD}' | base64 -d; echo
+```
+
+Every store namespace has a ResourceQuota and a LimitRange from the store chart (`quota` and `limitRange` in `charts/store/values.yaml`):
+
+```sh
+kubectl -n store-delhi describe resourcequota store
+```
+
+A store's woo-mcp can reach only its own WordPress and DNS, and a store's database and WordPress accept connections only from their own namespace (and WordPress from the Ingress controller). From Delhi's woo-mcp, Delhi's WordPress answers and Pune's is refused:
+
+```sh
+kubectl -n store-delhi exec deploy/woo-mcp -- node -e '
+for (const host of ["wordpress.store-delhi", "wordpress.store-pune", "mariadb-0.mariadb.store-pune"]) {
+  const s = require("net").connect({ host: host + ".svc.cluster.local", port: host.startsWith("mariadb") ? 3306 : 80, timeout: 3000 });
+  s.on("connect", () => { console.log(host, "open"); s.destroy(); });
+  s.on("error", (e) => console.log(host, e.code));
+  s.on("timeout", () => { console.log(host, "timeout"); s.destroy(); });
+}'
+```
+
 ### Check that woo-mcp is internal
 
 There is no Ingress for woo-mcp, and its NetworkPolicy admits only the gateway's pods. From any other pod the connection fails, for example from a throwaway pod in the `default` namespace:
@@ -246,19 +283,19 @@ echo "<token>" | docker login ghcr.io -u kajal-jotwani --password-stdin
 docker buildx build --platform linux/amd64 -f woo-mcp/Dockerfile -t ghcr.io/kajal-jotwani/woo-mcp:0.1.0 --push .
 docker buildx build --platform linux/amd64 -f notes-mcp/Dockerfile -t ghcr.io/kajal-jotwani/notes-mcp:0.1.0 --push .
 docker buildx build --platform linux/amd64 -f everything/Dockerfile -t ghcr.io/kajal-jotwani/everything:2.0.0 --push .
-docker buildx build --platform linux/amd64 -f gateway/Dockerfile -t ghcr.io/kajal-jotwani/gateway:0.1.0 --push .
+docker buildx build --platform linux/amd64 -f gateway/Dockerfile -t ghcr.io/kajal-jotwani/gateway:0.2.0 --push .
 ```
 
 Use `linux/arm64` if the VPS has an ARM processor. On GitHub, open each package's settings and set its visibility to public: the charts use no image pull secret.
 
 ### 3. Point two hostnames at the VPS
 
-Create DNS A records for `store.<your-domain>` and `app.<your-domain>` with the VPS's IP address. Without a domain, use `store.<vps-ip>.sslip.io` and `app.<vps-ip>.sslip.io`, which resolve to that IP with no setup.
+Create DNS A records for `store.<your-domain>` and `app.<your-domain>` with the VPS's IP address, and a wildcard record `*.<your-domain>` for the stores members create. Without a domain, use `store.<vps-ip>.sslip.io` and `app.<vps-ip>.sslip.io`, which resolve to that IP with no setup, as does every `store-<slug>.<vps-ip>.sslip.io`.
 
 Set them in the values files:
 
 - `charts/store/values-prod.yaml`: `store.url: http://store.<your-domain>`
-- `charts/gateway/values-prod.yaml`: `publicUrl: http://app.<your-domain>`
+- `charts/gateway/values-prod.yaml`: `publicUrl: http://app.<your-domain>` and `stores.domain: <your-domain>`
 
 The charts refuse to render while these are empty.
 

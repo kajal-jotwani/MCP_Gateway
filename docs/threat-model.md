@@ -7,7 +7,8 @@ The gateway sits between team members and MCP servers that hold the team's data 
 | Party | Trusted with | Not trusted with |
 |---|---|---|
 | Admin | Adding, editing and removing upstreams and their credentials; members, invites and everyone's keys; the whole audit log | Nothing beyond the dashboard: no cluster access is implied |
-| Member | Calling every tool of every enabled upstream, with its own API key or through the chat agent | Upstream URLs and credentials, other members' keys, other members' audit entries |
+| Member | Calling every tool of every enabled upstream, with its own API key or through the chat agent; creating up to 3 stores and deleting their own | Upstream URLs and credentials, other members' keys, other members' audit entries, other members' stores |
+| Store provisioner | Creating and deleting store namespaces and the store chart's objects inside them | Any namespace it did not create, including their Secrets |
 | Upstream server | Answering the calls routed to it | Instructions to the model, other upstreams' traffic, the client's API key |
 | Claude API | The chat conversation and the tool results of that turn | Upstream credentials, API keys |
 | Cluster operator | Everything: Secrets, databases, the gateway's process | Out of scope |
@@ -77,6 +78,18 @@ Only admins add servers, and admin changes to servers are not written to the aud
 - It runs wherever its URL points. The gateway can reach any address its pod can reach, including cluster-internal Services, so an admin can point an "upstream" at an internal HTTP service (server-side request forgery limited to admins). The gateway sends only MCP requests there and shows members only the resulting tool list and a short status (Connected or Unreachable, with a reason such as the HTTP status or a timeout). Restricting egress is not implemented, because upstreams may live anywhere.
 
 Recovery: disabling or removing the server removes its tools from every client on their next list and from the chat agent's next turn. Audit entries keep the server's name, so its past calls stay visible after it is removed.
+
+## Provisioned stores
+
+Members create stores from the dashboard, and a separate provisioner turns each request into a namespace with the store chart installed. What this adds:
+
+- The provisioner is the only workload with Kubernetes API rights. The internet-facing gateway has none: it writes a row to PostgreSQL, so a compromised gateway can request stores (subject to the per-member limit it enforces itself) but cannot create arbitrary objects in the cluster.
+- The provisioner's own rights are limited to namespaces it created. Its ClusterRole only creates and deletes namespaces, creates RoleBindings and binds the store role; it gets the store role inside a store namespace through a RoleBinding there. A ValidatingAdmissionPolicy denies its account any change outside a namespace labelled `app.kubernetes.io/managed-by: urumi-provisioner`, so it cannot grant itself rights in `kube-system`, delete the original `store` namespace, or take over a namespace by labelling it (it has no right to update namespaces, and a namespace is checked as it was before a delete). Residual risk: anyone who can create namespaces with that label, or who can run code in the provisioner's pod, gets the same reach over those namespaces. Any pod in the gateway namespace that runs under the provisioner's service account does too, so namespace RBAC on `gateway` is the boundary, as for woo-mcp.
+- A member can create up to 3 stores, each with up to 5 CPU and 3 GiB of memory in limits (ResourceQuota). On one small node, a few members creating stores at once can still exhaust it; the quota bounds each store, not the node. A member cannot delete or retry another member's store; admins can.
+- Store tools are shared with the whole team like every other upstream's: any member can call `delhi__create_product` on a store another member created. Ownership controls only creating and deleting the store.
+- One store cannot reach another. Each woo-mcp may connect only to its own WordPress and DNS (egress NetworkPolicy), and each store's MariaDB and WordPress accept connections only from their own namespace (and WordPress from the Ingress controller). Each store has its own generated Secret, so a leaked key of one store does not open another. WordPress and the setup Job keep open egress, because they download WooCommerce; a compromised WordPress can reach the internet and other stores' public storefronts, but not their databases.
+- Store names are user input. They are validated (60 characters, no control characters), turned into a DNS-label slug, and passed to Helm through a values file on stdin, never through a command line or `--set`.
+- A store's wp-admin password is in its Secret only. Members do not see it in the dashboard; whoever operates the cluster reads it with `kubectl`.
 
 ## Other gaps
 
