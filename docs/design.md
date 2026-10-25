@@ -1,6 +1,6 @@
 # Design
 
-Status: approved on 2026-10-23 and implemented. Statements marked **Verified** were checked against docs, package contents or the running system, with the build stage named where it matters. Statements marked **To verify** still need a check outside the build sandbox, on a Mac or on the VPS.
+Status: approved on 2026-10-23 and implemented. Statements marked **Verified** were checked against docs, package contents or the running system, with the build stage named where it matters. Statements marked **To verify** still need a check outside the build sandbox. The charts were not deployed to a public VPS (see [Production changes](#production-changes)).
 
 ## Components
 
@@ -366,14 +366,14 @@ Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and ever
 
 `values-prod.yaml` in each chart changes only:
 
-- Hostnames: `store.url` and `publicUrl`, real names whose DNS A records point to the VPS (`sslip.io` names work without a domain). They are empty in the file until the VPS is known, and the charts refuse to render without them.
+- Hostnames: `store.url` and `publicUrl`, real names whose DNS A records point to the VPS (`sslip.io` names work without a domain). They are empty in the file, because no VPS was set up, and the charts refuse to render without them.
 - Ingress: same Traefik class; TLS with cert-manager and Let's Encrypt is an optional extension.
 - Storage class: k3s `local-path` (the default on both k3d and k3s; set explicitly so the choice is visible).
 - Images: public GHCR packages (`ghcr.io/kajal-jotwani/...`, same tags) instead of locally imported images, so the charts need no image pull secret.
 - Resources: higher memory limits for WordPress and MariaDB (1 GiB each) and a higher MariaDB memory request (384 MiB).
 - Secrets: created with the same `kubectl` commands on the VPS, with new random values.
 
-**Verified (stage 8)** on the test k3s with a fresh install of both charts from `values-prod.yaml` in new namespaces (hostnames and the namespace wiring set with `--set`, images loaded under their GHCR names): the setup Job completed, all three upstreams connected, and the two-user acceptance run D1 to D9 passed. The run on a real VPS is still to do.
+**Verified (stage 8)** on the test k3s with a fresh install of both charts from `values-prod.yaml` in new namespaces (hostnames and the namespace wiring set with `--set`, images loaded under their GHCR names): the setup Job completed, all three upstreams connected, and the two-user acceptance run D1 to D9 passed, with a stand-in for the Claude API. The charts were not deployed to a public VPS: the GHCR push, DNS records, firewall and SSH tunnel steps in the README have not been run.
 
 ## Upgrade and rollback
 

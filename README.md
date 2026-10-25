@@ -219,9 +219,11 @@ kubectl run probe --rm -it --restart=Never --image=postgres:18.6-alpine3.24 -- \
 
 The same charts, with `values-prod.yaml` instead of `values-local.yaml`.
 
+These steps are documented but were not run on a public VPS. They were rehearsed on a k3s test cluster in the build environment: a fresh install of both charts from `values-prod.yaml`, with test hostnames and the namespace wiring set with `--set` and the images loaded under their GHCR names. The two-user acceptance run passed there, with a stand-in for the Claude API. The GHCR push, DNS records, firewall and SSH tunnel below have not been tested, and the hostnames in `values-prod.yaml` stay empty until a VPS exists.
+
 ### 1. Install k3s
 
-On the VPS (Ubuntu or Debian, 2 GB of memory or more):
+On the VPS (Ubuntu or Debian). Plan for about 4 GB of memory: the workloads' memory limits in `values-prod.yaml` add up to about 3.7 GiB, plus k3s itself. This is an estimate, not a tested minimum.
 
 ```sh
 curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.36.5+k3s1 sh -
