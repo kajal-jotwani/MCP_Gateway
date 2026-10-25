@@ -51,6 +51,7 @@ const app = createApp({
   mcpHandler,
   anthropic: new Anthropic({ apiKey: config.anthropicApiKey }),
   publicUrl: config.publicUrl,
+  stores: config.stores,
   dashboardDir: DASHBOARD_DIR,
 });
 const server = app.listen(config.port, () => {

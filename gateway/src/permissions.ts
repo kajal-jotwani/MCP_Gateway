@@ -15,6 +15,11 @@ export function mayManageKeysOf(actor: Member, ownerId: string): boolean {
   return isAdmin(actor) || (actor.active && actor.id === ownerId);
 }
 
+/** Members delete and retry their own stores; admins can do it for anyone's. */
+export function mayManageStoreOf(actor: Member, ownerId: string): boolean {
+  return isAdmin(actor) || (actor.active && actor.id === ownerId);
+}
+
 /**
  * Why an actor may not apply a role or active change to a member, or undefined when allowed.
  * Admins cannot demote or deactivate themselves, so the team always keeps an admin who can sign in.

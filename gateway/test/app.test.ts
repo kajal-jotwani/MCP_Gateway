@@ -19,7 +19,10 @@ import { createGatewayMcpHandler } from '../src/mcpEndpoint.js';
 import { UpstreamRegistry } from '../src/registry.js';
 import { changeMember, createMember, ensureFirstAdmin, hashPassword, verifyPassword } from '../src/team.js';
 import type { Member, Role } from '../src/team.js';
+import { listStoreTasks, markStoreFailed, markStoreReady } from '../src/stores.js';
+import type { StoreTask } from '../src/stores.js';
 import { listUpstreamConfigs } from '../src/upstreams.js';
+import type { Upstream } from '../src/upstreams.js';
 import { createTestDatabase } from './database.js';
 import { startFakeClaude } from './fakeClaude.js';
 import { eventually, onCleanup, runCleanups, startUpstream, text } from './fakeUpstreams.js';
@@ -88,6 +91,7 @@ async function startGateway(
     mcpHandler,
     anthropic,
     publicUrl: new URL('http://app.localtest.me'),
+    stores: { domain: 'localtest.me', maxPerMember: 2 },
     dashboardDir,
   });
   const server: Server = await new Promise((resolve) => {
@@ -618,6 +622,7 @@ describe('upstream servers', () => {
       'name',
       'slug',
       'status',
+      'storeId',
       'tools',
     ]);
     expect((await browser.request('POST', '/upstreams', { name: 'X', url: 'http://x' })).status).toBe(403);
@@ -719,6 +724,128 @@ describe('upstream servers', () => {
     expect((await add({ name: 'A', url: 'http://notes/mcp', auth: { type: 'bearer' } })).status).toBe(400);
     const [existing] = (await admin.request('GET', '/upstreams')).body.upstreams as { slug: string }[];
     expect((await add({ name: 'Copy', slug: existing!.slug, url: 'http://notes/mcp' })).status).toBe(409);
+  });
+});
+
+describe('stores', () => {
+  let isolated: Database;
+  beforeEach(async () => {
+    isolated = await isolatedDatabase();
+  });
+
+  it('records a store for the provisioner, and returns the same store when the create is retried', async () => {
+    const gateway = await startGateway(isolated);
+    const member = await newMember('member', isolated);
+    const browser = await new Browser(gateway).login(member.email, PASSWORD);
+
+    const created = await browser.request('POST', '/stores', { name: 'Delhi Shop' });
+    expect(created.status).toBe(201);
+    expect(created.body.store).toMatchObject({
+      slug: 'delhi-shop',
+      name: 'Delhi Shop',
+      url: 'http://store-delhi-shop.localtest.me',
+      ownerId: member.id,
+      ownerName: member.name,
+      status: 'provisioning',
+      reason: null,
+    });
+    const retried = await browser.request('POST', '/stores', { name: 'Delhi Shop' });
+    expect(retried.status).toBe(200);
+    expect(retried.body.store).toEqual(created.body.store);
+    expect(await listStoreTasks(isolated)).toHaveLength(1);
+  });
+
+  it('refuses a name another member or a server uses, and more stores than the limit', async () => {
+    const gateway = await startGateway(isolated);
+    const [first, second] = [await newMember('member', isolated), await newMember('member', isolated)];
+    const a = await new Browser(gateway).login(first.email, PASSWORD);
+    const b = await new Browser(gateway).login(second.email, PASSWORD);
+
+    expect((await a.request('POST', '/stores', { name: 'Pune' })).status).toBe(201);
+    expect((await b.request('POST', '/stores', { name: 'pune' })).status).toBe(409);
+    const [{ slug: serverSlug }] = (await isolated.query<{ slug: string }>('SELECT slug FROM upstreams')) as [
+      { slug: string },
+    ];
+    expect((await b.request('POST', '/stores', { name: serverSlug })).status).toBe(409);
+    expect((await a.request('POST', '/stores', { name: '!' })).status).toBe(400);
+    // The test gateway allows two stores per member.
+    expect((await a.request('POST', '/stores', { name: 'Mumbai' })).status).toBe(201);
+    const third = await a.request('POST', '/stores', { name: 'Goa' });
+    expect(third.status).toBe(409);
+    expect(third.body.error).toBe('You already have 2 stores, the most a member can have.');
+    // The admin cannot add a server under a store's slug either.
+    const admin = await adminBrowser(gateway);
+    expect((await admin.request('POST', '/upstreams', { name: 'Pune', url: 'http://x' })).status).toBe(409);
+  });
+
+  it('names a ready store’s tools after it and removes them from clients as soon as the store is deleted', async () => {
+    const gateway = await startGateway(isolated);
+    const storeMcp = await startUpstream(['list_orders', 'get_order']);
+    onCleanup(() => storeMcp.close());
+    const member = await newMember('member', isolated);
+    const browser = await new Browser(gateway).login(member.email, PASSWORD);
+    const { body } = await browser.request('POST', '/stores', { name: 'Delhi' });
+    const storeId = (body.store as { id: string }).id;
+
+    // What the provisioner does once the chart is installed, with the fake standing in for woo-mcp.
+    const [task] = (await listStoreTasks(isolated)) as [StoreTask];
+    expect(await markStoreReady(isolated, task)).toBe(true);
+    await isolated.query('UPDATE upstreams SET url = $1 WHERE store_id = $2', [storeMcp.url, storeId]);
+    const admin = await adminBrowser(gateway);
+    const upstreams = (await admin.request('GET', '/upstreams')).body.upstreams as Upstream[];
+    const storeUpstream = upstreams.find((upstream) => upstream.storeId === storeId)!;
+    expect(storeUpstream).toMatchObject({ slug: 'delhi', name: 'Delhi' });
+    // Enabling is allowed on a store's server and reloads the registry; other changes are not.
+    expect((await admin.request('PATCH', `/upstreams/${storeUpstream.id}`, { enabled: true })).status).toBe(
+      200,
+    );
+    expect((await admin.request('PATCH', `/upstreams/${storeUpstream.id}`, { url: 'http://x' })).status).toBe(
+      409,
+    );
+    expect((await admin.request('DELETE', `/upstreams/${storeUpstream.id}`)).status).toBe(409);
+
+    const client = await mcpClient(gateway, await newKey(isolated, member));
+    const names = async () => (await client.listTools()).tools.map((tool) => tool.name);
+    expect(await names()).toEqual([
+      'delhi__get_order',
+      'delhi__list_orders',
+      'fail',
+      'sleep',
+      expect.stringMatching(/^woo\d+__list_orders$/),
+    ]);
+    expect(text(await client.callTool({ name: 'delhi__list_orders', arguments: {} }))).toBe(
+      'list_orders done',
+    );
+
+    const deleted = await browser.request('DELETE', `/stores/${storeId}`);
+    expect(deleted.status).toBe(202);
+    expect(deleted.body.store).toMatchObject({ status: 'deleting' });
+    expect(await names()).toEqual(['fail', 'list_orders', 'sleep']);
+    expect((await isolated.query('SELECT 1 FROM upstreams WHERE store_id = $1', [storeId])).length).toBe(0);
+  });
+
+  it('lets members delete and retry only their own stores, and admins anyone’s', async () => {
+    const gateway = await startGateway(isolated);
+    const [owner, other] = [await newMember('member', isolated), await newMember('member', isolated)];
+    const ownerBrowser = await new Browser(gateway).login(owner.email, PASSWORD);
+    const otherBrowser = await new Browser(gateway).login(other.email, PASSWORD);
+    const { body } = await ownerBrowser.request('POST', '/stores', { name: 'Jaipur' });
+    const storeId = (body.store as { id: string }).id;
+
+    expect((await otherBrowser.request('GET', '/stores')).body.stores).toHaveLength(1);
+    expect((await otherBrowser.request('DELETE', `/stores/${storeId}`)).status).toBe(403);
+    expect((await ownerBrowser.request('POST', `/stores/${storeId}/retry`)).status).toBe(409);
+
+    const [task] = (await listStoreTasks(isolated)) as [StoreTask];
+    await markStoreFailed(isolated, task, 'The store chart failed to install: job failed');
+    expect((await otherBrowser.request('POST', `/stores/${storeId}/retry`)).status).toBe(403);
+    const retried = await ownerBrowser.request('POST', `/stores/${storeId}/retry`);
+    expect(retried.body.store).toMatchObject({ status: 'provisioning', reason: null });
+    const [retriedTask] = (await listStoreTasks(isolated)) as [StoreTask];
+    expect(retriedTask.attempt).toBe(2);
+
+    const admin = await adminBrowser(gateway);
+    expect((await admin.request('DELETE', `/stores/${storeId}`)).status).toBe(202);
   });
 });
 

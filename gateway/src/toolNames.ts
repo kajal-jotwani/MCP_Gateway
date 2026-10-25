@@ -13,6 +13,8 @@ const HASH_SUFFIX_LENGTH = 7; // '_' plus 6 hex characters
 export interface UpstreamTools {
   upstreamId: string;
   slug: string;
+  /** Prefix every tool with the slug, even without a collision. Set for provisioned stores. */
+  alwaysPrefix: boolean;
   tools: Tool[];
 }
 
@@ -36,30 +38,35 @@ function withHashSuffix(name: string, hashInput: string): string {
 /**
  * Maps every upstream tool to the name clients see. Names keep their upstream spelling, with
  * characters outside [A-Za-z0-9_-] replaced by '_'. A name exposed by more than one upstream becomes
- * `<slug>__<name>` on every one of them, so the result does not depend on registration order.
+ * `<slug>__<name>` on every one of them, so the result does not depend on registration order. Tools
+ * of an upstream with `alwaysPrefix` are always `<slug>__<name>`, so a store's tools name their store.
  * Names over the length limit, and any duplicate left after that, get a stable hash suffix. A name
  * that is still ambiguous after all of this is left out, so a call can never reach the wrong upstream.
  */
 export function exposeToolNames(upstreams: UpstreamTools[]): ExposedTool[] {
-  const candidates: { exposed: ExposedTool; slug: string }[] = [];
+  const candidates: { exposed: ExposedTool; slug: string; alwaysPrefix: boolean }[] = [];
   const upstreamsByBaseName = new Map<string, Set<string>>();
 
-  for (const { upstreamId, slug, tools } of upstreams) {
+  for (const { upstreamId, slug, alwaysPrefix, tools } of upstreams) {
     const seen = new Set<string>();
     for (const tool of tools) {
       // An upstream listing the same tool twice is broken; the first definition wins.
       if (tool.name === '' || seen.has(tool.name)) continue;
       seen.add(tool.name);
       const base = tool.name.replace(/[^A-Za-z0-9_-]/g, '_');
-      candidates.push({ exposed: { name: base, upstreamId, originalName: tool.name, tool }, slug });
+      candidates.push({
+        exposed: { name: base, upstreamId, originalName: tool.name, tool },
+        slug,
+        alwaysPrefix,
+      });
       const owners = upstreamsByBaseName.get(base) ?? new Set<string>();
       owners.add(upstreamId);
       upstreamsByBaseName.set(base, owners);
     }
   }
 
-  for (const { exposed, slug } of candidates) {
-    if ((upstreamsByBaseName.get(exposed.name)?.size ?? 0) > 1) {
+  for (const { exposed, slug, alwaysPrefix } of candidates) {
+    if (alwaysPrefix || (upstreamsByBaseName.get(exposed.name)?.size ?? 0) > 1) {
       exposed.name = `${slug}__${exposed.name}`;
     }
     if (exposed.name.length > MAX_TOOL_NAME_LENGTH) {

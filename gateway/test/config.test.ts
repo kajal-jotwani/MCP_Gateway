@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { loadConfig } from '../src/config.js';
+import { loadConfig, loadProvisionerConfig } from '../src/config.js';
 
 const validEnv = {
   PUBLIC_URL: 'http://app.localtest.me',
@@ -14,6 +14,8 @@ const validEnv = {
   SEED_UPSTREAM_SLUG: 'woocommerce',
   SEED_UPSTREAM_URL: 'http://woo-mcp.store.svc.cluster.local:3000/mcp',
   ANTHROPIC_API_KEY: 'test-anthropic-key',
+  STORE_DOMAIN: 'localtest.me',
+  MAX_STORES_PER_MEMBER: '3',
 };
 
 describe('loadConfig', () => {
@@ -48,5 +50,39 @@ describe('loadConfig', () => {
     expect(message).toContain('BOOTSTRAP_ADMIN_PASSWORD');
     expect(message).toContain('SEED_UPSTREAM_SLUG');
     expect(message).not.toContain(shortPassword);
+  });
+});
+
+describe('loadProvisionerConfig', () => {
+  const provisionerEnv = {
+    PGHOST: 'postgres',
+    PGUSER: 'gateway',
+    PGPASSWORD: 'database-password',
+    PGDATABASE: 'gateway',
+    GATEWAY_NAMESPACE: 'gateway',
+    PROVISIONER_SERVICE_ACCOUNT: 'gateway-provisioner',
+    STORE_ROLE: 'gateway-store',
+    STORE_CHART_PATH: '/app/charts/store',
+    STORE_VALUES_FILE: '/config/store-values.yaml',
+    PROVISION_TIMEOUT_MINUTES: '15',
+  };
+
+  it('reads a valid environment', () => {
+    expect(loadProvisionerConfig(provisionerEnv)).toMatchObject({
+      port: 8081,
+      gatewayNamespace: 'gateway',
+      valuesFiles: ['/config/store-values.yaml'],
+      timeoutMs: 15 * 60_000,
+    });
+  });
+
+  it('names every invalid variable', () => {
+    expect(() =>
+      loadProvisionerConfig({
+        ...provisionerEnv,
+        GATEWAY_NAMESPACE: 'Not_A_Namespace',
+        PROVISION_TIMEOUT_MINUTES: '0',
+      }),
+    ).toThrow(/GATEWAY_NAMESPACE[\s\S]*PROVISION_TIMEOUT_MINUTES/);
   });
 });

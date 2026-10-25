@@ -4,6 +4,7 @@ import {
   auditScopeOf,
   isAdmin,
   mayManageKeysOf,
+  mayManageStoreOf,
   mayUseTools,
   memberChangeRefusal,
 } from '../src/permissions.js';
@@ -31,6 +32,13 @@ describe('permissions', () => {
     expect(mayManageKeysOf(member, admin.id)).toBe(false);
     expect(mayManageKeysOf(admin, member.id)).toBe(true);
     expect(mayManageKeysOf(inactiveAdmin, member.id)).toBe(false);
+  });
+
+  it('lets members manage their own stores and admins anyone’s', () => {
+    expect(mayManageStoreOf(member, member.id)).toBe(true);
+    expect(mayManageStoreOf(member, admin.id)).toBe(false);
+    expect(mayManageStoreOf(admin, member.id)).toBe(true);
+    expect(mayManageStoreOf(inactiveAdmin, member.id)).toBe(false);
   });
 
   it('lets only admins change members, and not demote or deactivate themselves', () => {

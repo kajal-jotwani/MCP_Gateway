@@ -21,6 +21,8 @@ export interface UpstreamConfig {
   /** Sent as a header on every request to the upstream. Never leaves the gateway. */
   credential?: { header: string; value: string };
   enabled: boolean;
+  /** Set when the upstream is a provisioned store's woo-mcp. */
+  storeId?: string;
 }
 
 export interface UpstreamState {
@@ -376,7 +378,12 @@ export class UpstreamRegistry {
     const enabled = [...this.connections.values()].filter((connection) => connection.config.enabled);
     const names = new Map(enabled.map(({ config }) => [config.id, config.name]));
     const exposed = exposeToolNames(
-      enabled.map(({ config, tools }) => ({ upstreamId: config.id, slug: config.slug, tools })),
+      enabled.map(({ config, tools }) => ({
+        upstreamId: config.id,
+        slug: config.slug,
+        alwaysPrefix: config.storeId !== undefined,
+        tools,
+      })),
     ).map((tool) => ({ ...tool, upstreamName: names.get(tool.upstreamId) ?? '' }));
     const connected = new Set(enabled.filter((c) => c.status === 'connected').map((c) => c.config.id));
 

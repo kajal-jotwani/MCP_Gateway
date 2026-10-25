@@ -9,7 +9,7 @@ function tools(...names: string[]): Tool[] {
 }
 
 function upstream(slug: string, ...names: string[]): UpstreamTools {
-  return { upstreamId: `id-${slug}`, slug, tools: tools(...names) };
+  return { upstreamId: `id-${slug}`, slug, alwaysPrefix: false, tools: tools(...names) };
 }
 
 function namesOf(upstreams: UpstreamTools[]): Record<string, string> {
@@ -85,10 +85,33 @@ describe('exposeToolNames', () => {
     expect(exposed['store__search']).toBe('id-store:search');
   });
 
+  it('prefixes every tool of a store, and the tools it shares with other upstreams', () => {
+    expect(
+      namesOf([
+        upstream('woocommerce', 'list_orders', 'get_order'),
+        { ...upstream('delhi', 'list_orders', 'get_order'), alwaysPrefix: true },
+        upstream('notes', 'save_note'),
+      ]),
+    ).toEqual({
+      delhi__get_order: 'id-delhi:get_order',
+      delhi__list_orders: 'id-delhi:list_orders',
+      save_note: 'id-notes:save_note',
+      woocommerce__get_order: 'id-woocommerce:get_order',
+      woocommerce__list_orders: 'id-woocommerce:list_orders',
+    });
+  });
+
+  it('prefixes a store’s tools even when it is the only upstream', () => {
+    expect(namesOf([{ ...upstream('delhi', 'list_orders'), alwaysPrefix: true }])).toEqual({
+      delhi__list_orders: 'id-delhi:list_orders',
+    });
+  });
+
   it('uses the first definition when an upstream lists a tool twice', () => {
     const duplicate: UpstreamTools = {
       upstreamId: 'id-docs',
       slug: 'docs',
+      alwaysPrefix: false,
       tools: [
         { name: 'search', description: 'first', inputSchema: { type: 'object' } },
         { name: 'search', description: 'second', inputSchema: { type: 'object' } },

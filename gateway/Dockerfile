@@ -1,4 +1,7 @@
 # Build from the repository root: docker build -f gateway/Dockerfile .
+# The same image runs the gateway and the store provisioner, which needs helm and the store chart.
+FROM alpine/helm:4.3.1 AS helm
+
 FROM node:24.22.1-alpine3.24 AS build
 WORKDIR /app
 COPY package.json package-lock.json tsconfig.base.json ./
@@ -18,6 +21,8 @@ RUN npm ci --workspace gateway --omit=dev && npm cache clean --force
 COPY --from=build /app/gateway/dist gateway/dist
 COPY --from=build /app/dashboard/dist dashboard/dist
 COPY gateway/migrations gateway/migrations
+COPY --from=helm /usr/bin/helm /usr/local/bin/helm
+COPY charts/store charts/store
 USER node
 EXPOSE 8080
 CMD ["node", "gateway/dist/main.js"]

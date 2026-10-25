@@ -9,8 +9,18 @@ import { listAuditEntries } from './audit.js';
 import { chatFailureMessage, runChatTurn } from './chat.js';
 import type { ChatEvent, ChatTurn } from './chat.js';
 import type { Database } from './db.js';
-import { auditScopeOf, isAdmin, mayManageKeysOf } from './permissions.js';
+import { auditScopeOf, isAdmin, mayManageKeysOf, mayManageStoreOf } from './permissions.js';
 import type { UpstreamRegistry, UpstreamState } from './registry.js';
+import {
+  createStore,
+  getStore,
+  listStores,
+  requestStoreDeletion,
+  retryStore,
+  STORE_SLUG_PATTERN,
+  storeUrl,
+} from './stores.js';
+import type { CreateStoreRefusal } from './stores.js';
 import {
   acceptInvite,
   authenticatePassword,
@@ -54,6 +64,7 @@ export interface ApiDeps {
   registry: UpstreamRegistry;
   anthropic: Anthropic;
   publicUrl: URL;
+  stores: { domain: string; maxPerMember: number };
 }
 
 const SESSION_COOKIE = 'urumi_session';
@@ -151,6 +162,15 @@ const upstreamPatchBody = z.object({
   enabled: z.boolean().optional(),
 });
 
+const storeBody = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(1)
+    .max(60)
+    .regex(/^[^\p{Cc}]+$/u, 'must not contain control characters'),
+});
+
 const chatBody = z.object({
   messages: z
     .array(z.object({ role: z.enum(['user', 'assistant']), text: z.string().trim().min(1).max(20_000) }))
@@ -230,14 +250,30 @@ function upstreamView(upstream: Upstream, state: UpstreamState | undefined, admi
   };
 }
 
-function upstreamChangeRefusal(outcome: 'slug_taken' | 'secret_required'): HttpError {
-  return outcome === 'slug_taken'
-    ? new HttpError(409, 'Another server already uses this slug.')
-    : new HttpError(400, 'Enter the secret. It is required for this credential type and after a URL change.');
+function upstreamChangeRefusal(outcome: 'slug_taken' | 'secret_required' | 'store_managed'): HttpError {
+  if (outcome === 'slug_taken')
+    return new HttpError(409, 'Another server or a store already uses this slug.');
+  if (outcome === 'store_managed') {
+    return new HttpError(409, 'This server belongs to a store. Delete the store on the Stores page instead.');
+  }
+  return new HttpError(
+    400,
+    'Enter the secret. It is required for this credential type and after a URL change.',
+  );
+}
+
+function storeCreateRefusal(outcome: CreateStoreRefusal, maxPerMember: number): HttpError {
+  if (outcome === 'limit_reached') {
+    return new HttpError(409, `You already have ${maxPerMember} stores, the most a member can have.`);
+  }
+  if (outcome === 'being_deleted') {
+    return new HttpError(409, 'Your store with this name is still being deleted. Try again in a minute.');
+  }
+  return new HttpError(409, 'Another store or server already uses this name. Pick another name.');
 }
 
 /** The dashboard API under /api. Humans authenticate with a session cookie set by /api/login. */
-export function createApiRouter({ db, registry, anthropic, publicUrl }: ApiDeps): Router {
+export function createApiRouter({ db, registry, anthropic, publicUrl, stores }: ApiDeps): Router {
   const router = express.Router();
   const secureCookie = publicUrl.protocol === 'https:';
 
@@ -408,9 +444,60 @@ export function createApiRouter({ db, registry, anthropic, publicUrl }: ApiDeps)
 
   router.delete('/upstreams/:id', async (req, res) => {
     signedInAdmin(res);
-    if (!(await deleteUpstream(db, parseId(req.params.id)))) throw new HttpError(404, 'Not found.');
+    const deleted = await deleteUpstream(db, parseId(req.params.id));
+    if (!deleted) throw new HttpError(404, 'Not found.');
+    if (deleted === 'store_managed') throw upstreamChangeRefusal(deleted);
     await applyUpstreamChanges();
     res.status(204).end();
+  });
+
+  // Every member sees every store, because every store's tools are shared with the whole team.
+  router.get('/stores', async (_req, res) => {
+    signedInMember(res);
+    res.json({ stores: await listStores(db) });
+  });
+
+  // The provisioner picks the store up from the database. Sending the same name again returns the
+  // existing store with 200, so a client can retry a create whose response it never got.
+  router.post('/stores', async (req, res) => {
+    const member = signedInMember(res);
+    const { name } = parse(storeBody, req.body);
+    const slug = slugFromName(name);
+    if (!STORE_SLUG_PATTERN.test(slug)) {
+      throw new HttpError(400, 'Use a name with at least two letters or digits.');
+    }
+    const outcome = await createStore(db, {
+      slug,
+      name,
+      url: storeUrl(slug, stores.domain, publicUrl.protocol),
+      ownerId: member.id,
+      maxPerMember: stores.maxPerMember,
+    });
+    if (typeof outcome === 'string') throw storeCreateRefusal(outcome, stores.maxPerMember);
+    res.status(outcome.created ? 201 : 200).json({ store: outcome.store });
+  });
+
+  router.post('/stores/:id/retry', async (req, res) => {
+    const actor = signedInMember(res);
+    const store = await getStore(db, parseId(req.params.id));
+    if (!store) throw new HttpError(404, 'Not found.');
+    if (!mayManageStoreOf(actor, store.ownerId))
+      throw new HttpError(403, 'You can only retry your own stores.');
+    if (!(await retryStore(db, store.id))) throw new HttpError(409, 'Only a failed store can be retried.');
+    res.json({ store: await getStore(db, store.id) });
+  });
+
+  // Removing the store's upstream is part of the request, so its tools are gone from clients at once.
+  // The provisioner then deletes the namespace and, once it is gone, the store.
+  router.delete('/stores/:id', async (req, res) => {
+    const actor = signedInMember(res);
+    const store = await getStore(db, parseId(req.params.id));
+    if (!store) throw new HttpError(404, 'Not found.');
+    if (!mayManageStoreOf(actor, store.ownerId))
+      throw new HttpError(403, 'You can only delete your own stores.');
+    await requestStoreDeletion(db, store.id);
+    await applyUpstreamChanges();
+    res.status(202).json({ store: await getStore(db, store.id) });
   });
 
   // Streams the turn as newline-delimited JSON, so the dashboard can show text and tool calls as they
