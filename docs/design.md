@@ -323,7 +323,7 @@ The WooCommerce upstream is inserted on the gateway's first start from chart val
 | `store.<domain>`: WordPress | woo-mcp, MariaDB |
 | `app.<domain>`: gateway (dashboard, `/api`, `/mcp`) | PostgreSQL, notes-mcp, server-everything |
 
-Every workload has requests and limits and readiness and liveness probes that check something real:
+Every long-running workload has requests and limits and readiness and liveness probes that check something real (the setup Job has requests and limits instead of probes, and is bounded by `backoffLimit: 2` and `activeDeadlineSeconds: 900`):
 
 | Workload | Readiness | Liveness |
 |---|---|---|
@@ -347,7 +347,7 @@ Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and ever
 | K4 | WordPress, MariaDB, the setup Job, woo-mcp, the gateway (with the dashboard), PostgreSQL, notes-mcp and server-everything all run as workloads of the two charts |
 | K5 | PVCs for MariaDB, `wp-content`, PostgreSQL |
 | K6 | Traefik Ingress, `*.localtest.me` locally |
-| K7 | Probes and resources on every template |
+| K7 | Probes and resources on every long-running workload; resources and a deadline on the setup Job |
 | K8, G5 | Operator-created Secrets referenced by name; upstream credentials write-only in the API |
 | W1, W2, W3 | `woo-mcp/`, SDK v2 Streamable HTTP, five tools |
 | W4 | No Ingress, ClusterIP, NetworkPolicy from gateway only |
