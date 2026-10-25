@@ -41,6 +41,11 @@ function assistantText(message: AssistantMessage): string {
   return (text || message.error || '(no answer)').slice(0, MAX_TEXT);
 }
 
+/** The parts before the text of the current round, which is the text after the last tool call. */
+function withoutRoundText(parts: Part[]): Part[] {
+  return parts.slice(0, parts.findLastIndex((part) => part.kind === 'tool') + 1);
+}
+
 /** The assistant message after one streamed event. */
 function applyEvent(message: AssistantMessage, event: ChatEvent): AssistantMessage {
   switch (event.type) {
@@ -71,7 +76,12 @@ function applyEvent(message: AssistantMessage, event: ChatEvent): AssistantMessa
         ),
       };
     case 'error':
-      return { ...message, done: true, error: event.message };
+      return {
+        ...message,
+        parts: event.discardText ? withoutRoundText(message.parts) : message.parts,
+        done: true,
+        error: event.message,
+      };
     case 'done':
       return { ...message, done: true };
   }

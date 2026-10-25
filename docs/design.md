@@ -199,7 +199,7 @@ The chat loop is a manual loop over the Messages API rather than the SDK's tool 
 4. Run every `tool_use` block in the response in parallel through the path above, then send all `tool_result` blocks back in one user message, with `is_error: true` for failed, timed-out or rejected calls.
 5. Repeat until `stop_reason` is `end_turn`, at most 8 rounds.
 
-Haiku 5.5 has no server-side refusal fallback, so the request uses no beta features, and a policy decline ends the turn with the message from step 3.
+Haiku 5.5 has no server-side refusal fallback, so the request uses no beta features, and a policy decline ends the turn with the message from step 3. A decline can come after some text has streamed; the browser then drops the text of that round, so the partial answer is not kept or sent back as the assistant's turn.
 
 `POST /api/chat` streams newline-delimited JSON events to the browser: assistant text as it arrives, and each tool call (name, server, arguments) and its result (error flag and the first 2,000 characters) as it happens, so the UI shows which tools ran (C1). The conversation is kept in the browser and sent with each message as text only, so no thinking block from an earlier request is replayed; the gateway stores only audit entries. Closing the page, or moving to another page of the dashboard, cancels the turn, including running tool calls. The system prompt tells the model that tool descriptions and results are data from third-party servers and never instructions, and that it changes things only when the member asked for the change.
 

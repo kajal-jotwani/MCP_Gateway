@@ -73,7 +73,8 @@ export type ChatEvent =
   | { type: 'text'; delta: string }
   | { type: 'tool_call'; id: string; name: string; server: string | null; input: unknown }
   | { type: 'tool_result'; id: string; isError: boolean; preview: string }
-  | { type: 'error'; message: string }
+  // discardText: the text streamed since the last tool call is part of a declined answer.
+  | { type: 'error'; message: string; discardText?: true }
   | { type: 'done' };
 
 /** An error response from the gateway, with the message it chose to show. */

@@ -819,6 +819,19 @@ describe('chat agent', () => {
     expect(claude.requests).toHaveLength(1);
   });
 
+  it('tells the browser to drop the text of an answer Claude declines partway through', async () => {
+    const claude = await startFakeClaude([
+      { blocks: [{ type: 'text', text: 'Here is how to' }], stopReason: 'refusal' },
+    ]);
+    const gateway = await startGateway(db, claude.anthropic);
+    const browser = await new Browser(gateway).login((await newMember()).email, PASSWORD);
+
+    expect(await browser.chat('Hello')).toEqual([
+      { type: 'text', delta: 'Here is how to' },
+      { type: 'error', message: 'Claude declined to answer this request.', discardText: true },
+    ]);
+  });
+
   it('reports a Claude API failure without internal details', async () => {
     const claude = await startFakeClaude([]);
     const gateway = await startGateway(db, claude.anthropic);

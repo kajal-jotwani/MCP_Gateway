@@ -32,7 +32,8 @@ export type ChatEvent =
   | { type: 'text'; delta: string }
   | { type: 'tool_call'; id: string; name: string; server: string | null; input: unknown }
   | { type: 'tool_result'; id: string; isError: boolean; preview: string }
-  | { type: 'error'; message: string }
+  // discardText: the text streamed since the last tool call is part of a declined answer.
+  | { type: 'error'; message: string; discardText?: true }
   | { type: 'done' };
 
 export interface ChatDeps extends ToolCallDeps {
@@ -116,7 +117,9 @@ export async function runChatTurn(
     const message = await stream.finalMessage();
 
     if (message.stop_reason === 'refusal') {
-      emit({ type: 'error', message: 'Claude declined to answer this request.' });
+      // A decline can come after some text has streamed. That text is not a finished answer, so the
+      // browser drops it rather than keeping it and sending it back as the assistant's turn.
+      emit({ type: 'error', message: 'Claude declined to answer this request.', discardText: true });
       return;
     }
     const toolUses = message.content.filter(
