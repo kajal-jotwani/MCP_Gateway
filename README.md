@@ -11,7 +11,14 @@ What runs in the cluster:
 
 `woo-mcp`, the databases and the two extra upstreams have no Ingress and accept traffic only from their own clients (NetworkPolicies). How it works and why: [docs/design.md](docs/design.md). Risks and limits: [docs/threat-model.md](docs/threat-model.md).
 
-No optional extensions are implemented.
+Optional work: the multi-store bonus was not attempted. Of the other stand-out items, these are done in part:
+
+- Upgrades and rollback: Helm upgrade with automatic rollback, tested with a bad image tag; see [Upgrades, rollback and backups](#upgrades-rollback-and-backups) and "Upgrade and rollback" in [docs/design.md](docs/design.md).
+- Security hardening: default-deny ingress NetworkPolicies in both namespaces, and non-root containers with all capabilities dropped (one init container runs as root with only `CHOWN`). No component uses the Kubernetes API, so the charts create no RBAC, and the gateway, woo-mcp and upstream pods mount no service account token. Not done: an SSRF guard for upstream URLs and encryption of upstream credentials at rest ([docs/threat-model.md](docs/threat-model.md)).
+- Observability: the Servers page shows why an upstream is Unreachable, and each audit entry gives the reason a call failed or was rejected. There are no metrics.
+- Production-like deployment: `values-prod.yaml` and the [VPS setup](#vps-setup-k3s) steps, rehearsed on a k3s test cluster but not deployed to a public VPS.
+
+Not attempted: tool permissions per role or user, OAuth on the gateway, search-then-execute for many tools, hosting MCP servers from container images, and more than one gateway replica or rate limits.
 
 ## Requirements
 
