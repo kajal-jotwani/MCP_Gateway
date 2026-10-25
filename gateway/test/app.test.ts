@@ -755,8 +755,10 @@ describe('chat agent', () => {
     expect(entry).toMatchObject({ via: 'chat', keyPrefix: null, tool: 'list_orders', outcome: 'succeeded' });
 
     const [first, second] = claude.requests;
-    expect(first?.body).toMatchObject({ model: 'claude-opus-5-5', fallbacks: 'default' });
-    expect(first?.betas).toContain('server-side-fallback-2026-07-01');
+    expect(first?.body).toMatchObject({ model: 'claude-haiku-5-5', output_config: { effort: 'medium' } });
+    // Haiku 5.5 has no server-side fallback, so the request carries neither fallbacks nor a beta.
+    expect(first?.body).not.toHaveProperty('fallbacks');
+    expect(first?.betas).toBeUndefined();
     expect((first?.body.tools as { name: string }[]).map((tool) => tool.name)).toEqual([
       'fail',
       'list_orders',

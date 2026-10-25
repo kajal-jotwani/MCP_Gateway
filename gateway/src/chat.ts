@@ -5,7 +5,7 @@ import type { Member } from './team.js';
 import { callTool } from './toolCalls.js';
 import type { ToolCallDeps } from './toolCalls.js';
 
-export const CHAT_MODEL = 'claude-opus-5-5';
+export const CHAT_MODEL = 'claude-haiku-5-5';
 // A question that needs more rounds than this is more likely a loop than real work.
 const MAX_TOOL_ROUNDS = 8;
 const MAX_TOKENS = 32_000;
@@ -45,7 +45,7 @@ export interface ChatDeps extends ToolCallDeps {
  * time goes in the last user message rather than the system prompt, so the tools and system prompt
  * stay a cacheable prefix across turns.
  */
-function conversationOf(history: ChatTurn[]): Anthropic.Beta.BetaMessageParam[] {
+function conversationOf(history: ChatTurn[]): Anthropic.MessageParam[] {
   const now = new Date().toISOString();
   return history.map((turn, index) =>
     index === history.length - 1
@@ -92,7 +92,7 @@ export async function runChatTurn(
 ): Promise<void> {
   // The tool list is fixed for the whole turn: changing it between rounds would invalidate the
   // turn's thinking blocks. A tool disabled meanwhile fails in callTool with a clear error.
-  const tools: Anthropic.Beta.BetaTool[] = deps.registry.listTools().map(({ name, tool }) => ({
+  const tools: Anthropic.Tool[] = deps.registry.listTools().map(({ name, tool }) => ({
     name,
     description: tool.description,
     input_schema: tool.inputSchema,
@@ -100,7 +100,7 @@ export async function runChatTurn(
   const messages = conversationOf(history);
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const stream = deps.anthropic.beta.messages.stream(
+    const stream = deps.anthropic.messages.stream(
       {
         model: CHAT_MODEL,
         max_tokens: MAX_TOKENS,
@@ -109,9 +109,6 @@ export async function runChatTurn(
         messages,
         output_config: { effort: 'medium' },
         cache_control: { type: 'ephemeral' },
-        // On a policy refusal the API retries the same request on a fallback model it picks.
-        betas: ['server-side-fallback-2026-07-01'],
-        fallbacks: 'default',
       },
       { signal },
     );
@@ -123,7 +120,7 @@ export async function runChatTurn(
       return;
     }
     const toolUses = message.content.filter(
-      (block): block is Anthropic.Beta.BetaToolUseBlock => block.type === 'tool_use',
+      (block): block is Anthropic.ToolUseBlock => block.type === 'tool_use',
     );
     // A tool input cut off at max_tokens can still parse, so never run tools from such a response.
     if (message.stop_reason === 'max_tokens') {
@@ -138,7 +135,7 @@ export async function runChatTurn(
     messages.push({ role: 'assistant', content: message.content });
     // Parallel tool calls run together and their results go back in one message.
     const results = await Promise.all(
-      toolUses.map(async (block): Promise<Anthropic.Beta.BetaToolResultBlockParam> => {
+      toolUses.map(async (block): Promise<Anthropic.ToolResultBlockParam> => {
         emit({
           type: 'tool_call',
           id: block.id,

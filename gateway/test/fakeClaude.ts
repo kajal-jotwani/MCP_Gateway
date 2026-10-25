@@ -32,7 +32,7 @@ function streamEvents(response: ScriptedResponse, index: number): string {
         id: `msg_${index}`,
         type: 'message',
         role: 'assistant',
-        model: 'claude-opus-5-5',
+        model: 'claude-haiku-5-5',
         content: [],
         stop_reason: null,
         stop_sequence: null,
