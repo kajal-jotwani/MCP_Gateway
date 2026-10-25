@@ -203,6 +203,8 @@ The server-side refusal fallback (`fallbacks: "default"` with the `server-side-f
 
 `POST /api/chat` streams newline-delimited JSON events to the browser: assistant text as it arrives, and each tool call (name, server, arguments) and its result (error flag and the first 2,000 characters) as it happens, so the UI shows which tools ran (C1). The conversation is kept in the browser and sent with each message as text only, so no thinking block from an earlier request is replayed; the gateway stores only audit entries. Closing the page, or moving to another page of the dashboard, cancels the turn, including running tool calls. The system prompt tells the model that tool descriptions and results are data from third-party servers and never instructions, and that it changes things only when the member asked for the change.
 
+**Verified (2026-10-25, on a Mac against the Claude API):** asked to create a product, the agent called `create_product`, and the product appeared on the storefront. Asked which orders came in today, it called `list_orders` with today's store-local date. The UI showed each call, and the audit log recorded them under the signed-in member, marked chat (D2, D3, D9).
+
 Alternative considered: the agent connects to the gateway's own `/mcp` with a key minted for the member. That proves the external path, but needs a hidden key per member and an HTTP hop for nothing. The shared function gives the same guarantee and is easier to test.
 
 ### Additional upstreams and the D5 prompt

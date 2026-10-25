@@ -93,7 +93,7 @@ helm upgrade --install store charts/store -n store -f charts/store/values-local.
 helm upgrade --install gateway charts/gateway -n gateway -f charts/gateway/values-local.yaml --rollback-on-failure --timeout 10m
 ```
 
-The store chart's setup Job installs WordPress and WooCommerce, enables cash on delivery, stores the REST key for woo-mcp and adds two sample products. It runs on every install and upgrade, and every step is safe to repeat: it creates what is missing and resets the store settings it manages (timezone, permalinks, currency, country, coming-soon mode, shipping) to the chart values. No step in wp-admin is needed, and a change to those settings made in wp-admin is undone by the next upgrade.
+The store chart's setup Job installs WordPress and WooCommerce, enables cash on delivery, stores the REST key for woo-mcp and adds two sample products. It runs on every install and upgrade, and every step is safe to repeat: it creates what is missing and resets the store settings it manages (timezone, permalinks, currency, country, coming-soon mode, shipping) to the chart values. No step in wp-admin is needed, and a change to those settings made in wp-admin is undone by the next upgrade. On a fresh install the Job log shows `sendmail: can't connect to remote host (127.0.0.1)` while it enables cash on delivery: that step tries to send an email, and the cluster has no mail server. Nothing depends on that email.
 
 ### 5. Open the store and the dashboard
 
@@ -158,8 +158,10 @@ MCP Inspector, from a terminal:
 npx @modelcontextprotocol/inspector@2.12.0 --cli http://app.localtest.me/mcp --transport http \
   --header "Authorization: Bearer <your API key>" --method tools/list
 npx @modelcontextprotocol/inspector@2.12.0 --cli http://app.localtest.me/mcp --transport http \
-  --header "Authorization: Bearer <your API key>" --method tools/call --tool-name list_orders --tool-arg after=2026-10-24T00:00:00
+  --header "Authorization: Bearer <your API key>" --method tools/call --tool-name list_orders --tool-arg after=YYYY-MM-DDT00:00:00
 ```
+
+In the second command, replace `YYYY-MM-DD` with today's date. `after` is in store time, so this lists today's orders.
 
 The client sees the tools of every enabled, connected server. Tool names are the servers' own (`list_orders`, `save_note`); only when two servers expose the same name are both renamed to `<slug>__<name>`, and the Servers page says why.
 

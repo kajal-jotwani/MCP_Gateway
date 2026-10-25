@@ -204,7 +204,7 @@ function signedInAdmin(res: Response): Member {
  */
 function requireCustomHeader(req: Request, _res: Response, next: NextFunction): void {
   if (req.method !== 'GET' && req.get('x-requested-with') !== 'urumi-dashboard') {
-    throw new HttpError(403, 'Missing X-Requested-With header.');
+    throw new HttpError(403, 'The X-Requested-With header must be urumi-dashboard.');
   }
   next();
 }
