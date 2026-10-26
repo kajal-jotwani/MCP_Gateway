@@ -3,6 +3,7 @@ import type { CallToolResult } from '@modelcontextprotocol/client';
 import { writeAuditEntry } from './audit.js';
 import type { AuditEntryInput, Via } from './audit.js';
 import type { Queryable } from './db.js';
+import { recordToolCall } from './metrics.js';
 import { mayUseTools } from './permissions.js';
 import { UpstreamCallError } from './registry.js';
 import type { UpstreamRegistry } from './registry.js';
@@ -27,7 +28,9 @@ export interface ToolCallDeps {
   registry: UpstreamRegistry;
 }
 
-type Outcome = Pick<AuditEntryInput, 'outcome' | 'reason' | 'upstreamId' | 'upstreamName' | 'tool'>;
+type Outcome = Pick<AuditEntryInput, 'outcome' | 'reason' | 'upstreamId' | 'upstreamName' | 'tool'> & {
+  upstreamSlug?: string;
+};
 
 function toolError(message: string): CallToolResult {
   return { content: [{ type: 'text', text: message }], isError: true };
@@ -51,12 +54,15 @@ export async function callTool(deps: ToolCallDeps, caller: Caller, call: ToolCal
     outcome = run.outcome;
     return run.result;
   } finally {
+    const { upstreamSlug, ...audited } = outcome;
+    const durationMs = Date.now() - started;
+    recordToolCall({ upstream: upstreamSlug, outcome: audited.outcome, via: caller.via, durationMs });
     await writeAuditEntry(deps.db, {
       memberId: caller.member.id,
       keyPrefix: caller.keyPrefix,
       via: caller.via,
-      durationMs: Date.now() - started,
-      ...outcome,
+      durationMs,
+      ...audited,
     });
   }
 }
@@ -78,7 +84,12 @@ async function runToolCall(
     return { result: toolError(reason), outcome: { outcome: 'rejected', reason, tool: requestedName } };
   }
 
-  const target = { upstreamId: tool.upstreamId, upstreamName: tool.upstreamName, tool: tool.originalName };
+  const target = {
+    upstreamId: tool.upstreamId,
+    upstreamName: tool.upstreamName,
+    upstreamSlug: tool.upstreamSlug,
+    tool: tool.originalName,
+  };
   try {
     const result = await registry.callTool(tool, call.arguments, call.signal);
     return result.isError

@@ -8,6 +8,7 @@ import { loadConfig } from './config.js';
 import type { GatewayConfig } from './config.js';
 import { createPostgresDatabase, migrate, waitForDatabase } from './db.js';
 import { createGatewayMcpHandler } from './mcpEndpoint.js';
+import { reportUpstreamStates, startMetricsServer } from './metrics.js';
 import { UpstreamRegistry } from './registry.js';
 import { ensureFirstAdmin } from './team.js';
 import { listUpstreamConfigs, seedUpstreamOnce } from './upstreams.js';
@@ -57,6 +58,8 @@ const app = createApp({
 const server = app.listen(config.port, () => {
   console.log(JSON.stringify({ event: 'listening', port: config.port }));
 });
+reportUpstreamStates(() => registry.states().values());
+const metricsServer = startMetricsServer(config.metricsPort);
 
 const loadUpstreams = () => listUpstreamConfigs(db);
 // Connecting to upstreams happens after the server is up, so readiness never waits on an upstream.
@@ -75,6 +78,7 @@ const refreshTimer = setInterval(() => {
 process.on('SIGTERM', () => {
   clearInterval(refreshTimer);
   server.close();
+  metricsServer.close();
   void mcpHandler
     .close()
     .then(() => registry.close())

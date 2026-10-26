@@ -37,7 +37,17 @@ export interface UpstreamTool {
   description: string | null;
 }
 
-/** An upstream server. url, authType and authHeaderName are only sent to admins. */
+/** Calls to one server in the last 24 hours. */
+export interface UpstreamStats {
+  calls: number;
+  errors: number;
+  timedOut: number;
+  rejected: number;
+  p50Ms: number | null;
+  p95Ms: number | null;
+}
+
+/** An upstream server. url, authType, authHeaderName and stats are only sent to admins. */
 export interface Upstream {
   id: string;
   slug: string;
@@ -46,6 +56,7 @@ export interface Upstream {
   url?: string;
   authType?: AuthType;
   authHeaderName?: string | null;
+  stats?: UpstreamStats;
   status: UpstreamStatus;
   error: string | null;
   checkedAt: string | null;

@@ -21,6 +21,7 @@ import { changeMember, createMember, ensureFirstAdmin, hashPassword, verifyPassw
 import type { Member, Role } from '../src/team.js';
 import { listStoreTasks, markStoreFailed, markStoreReady } from '../src/stores.js';
 import type { StoreTask } from '../src/stores.js';
+import { startMetricsServer } from '../src/metrics.js';
 import { listUpstreamConfigs } from '../src/upstreams.js';
 import type { Upstream } from '../src/upstreams.js';
 import { createTestDatabase } from './database.js';
@@ -630,6 +631,45 @@ describe('upstream servers', () => {
       403,
     );
     expect((await browser.request('DELETE', `/upstreams/${upstream!.id}`)).status).toBe(403);
+  });
+
+  it('gives admins calls, errors and latency per server from the audit log', async () => {
+    const gateway = await startGateway(isolated);
+    const member = await newMember('member', isolated);
+    const client = await mcpClient(gateway, await newKey(isolated, member));
+    await client.callTool({ name: 'list_orders', arguments: {} });
+    await client.callTool({ name: 'list_orders', arguments: {} });
+    await client.callTool({ name: 'fail', arguments: {} });
+    await client.callTool({ name: 'sleep', arguments: { ms: 1000 } });
+
+    const [upstream] = (await (await adminBrowser(gateway)).request('GET', '/upstreams')).body.upstreams as {
+      stats: Record<string, unknown>;
+    }[];
+    expect(upstream!.stats).toMatchObject({ calls: 4, errors: 2, timedOut: 1, rejected: 0 });
+    expect(upstream!.stats.p95Ms).toBeGreaterThanOrEqual(250);
+    const asMember = await new Browser(gateway).login(member.email, PASSWORD);
+    expect((await asMember.request('GET', '/upstreams')).body.upstreams).toEqual([
+      expect.not.objectContaining({ stats: expect.anything() }),
+    ]);
+  });
+
+  it('counts tool calls per upstream and outcome on the metrics port', async () => {
+    const gateway = await startGateway(isolated);
+    const [{ slug }] = (await isolated.query<{ slug: string }>('SELECT slug FROM upstreams')) as [
+      { slug: string },
+    ];
+    const client = await mcpClient(gateway, await newKey(isolated, await newMember('member', isolated)));
+    await client.callTool({ name: 'list_orders', arguments: {} });
+    await client.callTool({ name: 'fail', arguments: {} });
+    const metricsServer = startMetricsServer(0);
+    onCleanup(() => new Promise<void>((resolve) => metricsServer.close(() => resolve())));
+    await new Promise((resolve) => metricsServer.once('listening', resolve));
+
+    const port = (metricsServer.address() as AddressInfo).port;
+    const metrics = await (await fetch(`http://127.0.0.1:${port}/metrics`)).text();
+    expect(metrics).toContain(`gateway_tool_calls_total{upstream="${slug}",outcome="succeeded",via="mcp"} 1`);
+    expect(metrics).toContain(`gateway_tool_calls_total{upstream="${slug}",outcome="failed",via="mcp"} 1`);
+    expect(metrics).toContain(`gateway_tool_call_duration_seconds_count{upstream="${slug}"} 2`);
   });
 
   it('keeps the stored secret on edits but requires it again when the URL changes', async () => {

@@ -153,7 +153,7 @@ On top of that:
 | Client `tools/list` at the gateway | No upstream call | Served from cache, so a dead upstream cannot slow it |
 | WooCommerce REST call inside woo-mcp | 20 s | Under the gateway's 30 s so woo-mcp can return a clear error first |
 
-A timed-out call is cancelled (the SDK aborts the request) and returns an MCP tool error: `Upstream "Notes" did not respond within 30 s.` Unreachable upstreams return `Upstream "Notes" is unreachable.` Neither message includes URLs or credentials. Upstream results over 1 MB are replaced by an error, and the chat agent passes Claude at most 50,000 characters of one result.
+A timed-out call is cancelled (the SDK aborts the request) and returns an MCP tool error: `Upstream "Notes" did not respond within 30 s.` Unreachable upstreams return `Upstream "Notes" is unreachable: <reason>.`, with a reason as described under Observability. Neither message includes URLs or credentials. Upstream results over 1 MB are replaced by an error, and the chat agent passes Claude at most 50,000 characters of one result.
 
 Cache invalidation: the per-upstream tool cache is replaced on every successful refresh, on admin edits to the URL or credential, and on upstream `list_changed`. It is dropped when the upstream is disabled or removed. Tools from an Unreachable upstream are hidden from `tools/list`, because listing tools that will fail wastes the model's turns.
 
@@ -289,6 +289,16 @@ The gateway process does hold state in memory: the upstream clients, the tool ca
 
 Auth and audit would still be correct, because they read and write PostgreSQL on every request. The chart runs one replica; during a rolling update the old and new pods overlap for a few seconds, which the periodic re-read covers. Fixing the above would mean `LISTEN/NOTIFY` for admin changes and storing status in PostgreSQL; that is the scaling extension and out of scope.
 
+### Observability
+
+Three views, each for a different reader:
+
+- **Why an upstream is unreachable.** The registry walks the error's cause chain and reports the first specific reason: DNS lookup failed, connection refused, connection reset, connect timeout, host unreachable, TLS handshake failed (with the OpenSSL code), not an MCP server (wrong content type), redirect (the gateway does not follow redirects, so a credential cannot leave for another host), HTTP status, credential rejected (401/403), timed out, or an MCP protocol error. The reason is shown on the Servers page, logged in `upstream_status`, and appended to the error a client or the model gets for a call to that upstream (`Upstream "Notes" is unreachable: connection refused (nothing is listening on that port).`). Reasons never contain host names, URLs or credentials.
+- **Per-server numbers for admins.** The Servers page shows, for each server, calls in the last 24 hours, the error rate (failed and timed-out calls over calls that reached the server), how many timed out, p50 and p95 latency, and how many were rejected. They are computed from `audit_entries` with `percentile_cont`, so they cover every replica and survive restarts, and need no metrics stack. An index on `(upstream_id, at)` keeps the query to one day of rows. Members do not get them, as they do not get other members' audit entries.
+- **Prometheus metrics for operators.** Each gateway pod serves `/metrics` on port 9464: `gateway_tool_calls_total{upstream,outcome,via}`, `gateway_tool_call_duration_seconds{upstream}` (a histogram with buckets up to the 30 s call timeout), `gateway_upstream_up{upstream}`, and Node's process metrics. The label is the upstream's slug, so cardinality stays at one series set per server. The port is not in the Service, so the Ingress cannot reach it, and the NetworkPolicy admits it only from `metrics.scrapeNamespace` when that is set. The pod carries the usual `prometheus.io/scrape` annotations. No Prometheus is installed by the charts; `kubectl port-forward` shows the endpoint.
+
+The audit log stays the record of each call. Metrics are counts per process, and reset when a pod restarts, which Prometheus handles for counters.
+
 ### Multi-store provisioning
 
 The bonus: members create and delete stores from the dashboard. Each store is provisioned in its own namespace, with its own database, Secrets, volumes and Ingress host, and its own woo-mcp registered in the gateway without manual steps.
@@ -403,6 +413,7 @@ Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and ever
 | T2 | `urk_` keys, SHA-256, revocation checked on every call |
 | T4, D9 | `writeAuditEntry` in the single tool-call path, audit page in the dashboard |
 | C1, C2, C3 | Claude Messages API loop in the gateway using the same path, tool calls streamed to the UI, key in a Secret |
+| Observability | Failure reasons from the error cause chain; per-server stats from `audit_entries`; Prometheus `/metrics` on port 9464 |
 | Multi-store bonus | `stores` table and Stores page; provisioner running Helm per namespace `store-<slug>`; RBAC bound per store namespace plus an admission policy; quota, LimitRange, per-member limit and timeout; woo-mcp egress policy; store tools always `<slug>__<tool>` |
 
 ## Production changes

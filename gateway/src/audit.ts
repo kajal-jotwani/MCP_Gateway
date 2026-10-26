@@ -85,3 +85,37 @@ export async function listAuditEntries(
     [filter.memberId ?? null, filter.before ?? null, filter.limit],
   );
 }
+
+/** One upstream's calls over a period, from its audit entries. Latency leaves out rejected calls. */
+export interface UpstreamCallStats {
+  calls: number;
+  /** Calls that failed or timed out. */
+  errors: number;
+  timedOut: number;
+  rejected: number;
+  p50Ms: number | null;
+  p95Ms: number | null;
+}
+
+/**
+ * Call counts, errors and latency percentiles per upstream id over the last `hours`. Read from the
+ * audit log, so the numbers cover every gateway replica and survive restarts.
+ */
+export async function upstreamCallStats(
+  db: Queryable,
+  hours: number,
+): Promise<Map<string, UpstreamCallStats>> {
+  const rows = await db.query<UpstreamCallStats & { upstreamId: string }>(
+    `SELECT upstream_id AS "upstreamId", count(*)::int AS calls,
+       count(*) FILTER (WHERE outcome IN ('failed', 'timed_out'))::int AS errors,
+       count(*) FILTER (WHERE outcome = 'timed_out')::int AS "timedOut",
+       count(*) FILTER (WHERE outcome = 'rejected')::int AS rejected,
+       round(percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE outcome <> 'rejected'))::int AS "p50Ms",
+       round(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE outcome <> 'rejected'))::int AS "p95Ms"
+     FROM audit_entries
+     WHERE upstream_id IS NOT NULL AND at > now() - make_interval(hours => $1)
+     GROUP BY upstream_id`,
+    [hours],
+  );
+  return new Map(rows.map(({ upstreamId, ...stats }) => [upstreamId, stats]));
+}

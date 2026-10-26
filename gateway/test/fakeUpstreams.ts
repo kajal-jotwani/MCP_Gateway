@@ -109,6 +109,20 @@ export async function startSilentServer(): Promise<string> {
   return `http://127.0.0.1:${port}/mcp`;
 }
 
+/** A plain HTTP server that answers every request with the given status, headers and body. */
+export async function startPlainServer(
+  status: number,
+  headers: Record<string, string>,
+  body = '',
+): Promise<string> {
+  const server = createServer((_req, res) => {
+    res.writeHead(status, headers).end(body);
+  });
+  const port = await listen(server);
+  onCleanup(() => closeServer(server));
+  return `http://127.0.0.1:${port}/mcp`;
+}
+
 /** A URL nothing listens on. */
 export async function deadUrl(): Promise<string> {
   const server = createServer();

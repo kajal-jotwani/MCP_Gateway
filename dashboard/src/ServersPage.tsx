@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { FormEvent } from 'react';
 
 import { api, useAction, useApi } from './api';
-import type { AuthType, Member, Upstream, UpstreamStatus, UpstreamTool } from './api';
+import type { AuthType, Member, Upstream, UpstreamStats, UpstreamStatus, UpstreamTool } from './api';
 import { ErrorText, formatTime } from './ui';
 
 // Matches the gateway's refresh loop closely enough that a dead server shows as Unreachable within
@@ -55,6 +55,19 @@ function describeCredential(upstream: Upstream): string {
   if (upstream.authType === 'bearer') return 'Bearer token (stored, never shown)';
   if (upstream.authType === 'header') return `${upstream.authHeaderName} header (stored, never shown)`;
   return 'No credential';
+}
+
+function describeStats(stats: UpstreamStats): string {
+  if (stats.calls === 0) return 'No calls in the last 24 hours.';
+  const answered = stats.calls - stats.rejected;
+  const parts = [`${stats.calls} call${stats.calls === 1 ? '' : 's'} in the last 24 hours`];
+  if (answered > 0) {
+    const errorRate = ((stats.errors / answered) * 100).toFixed(1);
+    parts.push(`${errorRate}% errors${stats.timedOut ? ` (${stats.timedOut} timed out)` : ''}`);
+    parts.push(`p50 ${stats.p50Ms} ms, p95 ${stats.p95Ms} ms`);
+  }
+  if (stats.rejected) parts.push(`${stats.rejected} rejected`);
+  return parts.join(' · ');
 }
 
 function renameReason(tool: UpstreamTool, upstream: Upstream): string {
@@ -118,6 +131,7 @@ function ServerCard({
         </p>
       )}
       <p className="muted">Last checked: {formatTime(upstream.checkedAt)}</p>
+      {upstream.stats && <p className="muted">{describeStats(upstream.stats)}</p>}
       {upstream.storeId && (
         <p className="muted">Registered by its store. Delete the store on the Stores page to remove it.</p>
       )}

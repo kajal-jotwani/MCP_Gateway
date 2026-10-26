@@ -11,6 +11,7 @@ import {
   eventually,
   onCleanup,
   runCleanups,
+  startPlainServer,
   startSilentServer,
   startUpstream,
   text,
@@ -188,10 +189,26 @@ describe('gateway core', () => {
 
     expect(registry.states().get('id-dead')).toMatchObject({
       status: 'unreachable',
-      error: 'connection failed',
+      error: 'connection refused (nothing is listening on that port)',
     });
     expect(registry.states().get('id-woocommerce')).toMatchObject({ status: 'connected' });
     expect(await toolNames(client)).toEqual(['list_orders']);
+  });
+
+  it('says why an upstream is unreachable for DNS failures, non-MCP answers and redirects', async () => {
+    const { registry } = await startGateway([
+      upstream('nodns', 'No DNS', 'http://no-such-upstream.invalid/mcp'),
+      upstream('html', 'HTML', await startPlainServer(200, { 'content-type': 'text/html' }, '<html>')),
+      upstream('moved', 'Moved', await startPlainServer(302, { location: 'http://example.com/' })),
+    ]);
+
+    expect(registry.states().get('id-nodns')?.error).toMatch(/^DNS lookup failed \(/);
+    expect(registry.states().get('id-html')?.error).toBe(
+      'the server did not answer as an MCP server (unexpected content type)',
+    );
+    expect(registry.states().get('id-moved')?.error).toBe(
+      'the server answered with a redirect, which the gateway does not follow',
+    );
   });
 
   it('reports an upstream that rejects the gateway’s credential', async () => {
@@ -237,7 +254,9 @@ describe('gateway core', () => {
     const result = await client.callTool({ name: 'list_orders', arguments: {} });
 
     expect(result.isError).toBe(true);
-    expect(text(result)).toBe('Upstream "WooCommerce" is unreachable.');
+    expect(text(result)).toBe(
+      'Upstream "WooCommerce" is unreachable: connection refused (nothing is listening on that port).',
+    );
     await eventually(() => expect(registry.states().get('id-woocommerce')?.status).toBe('unreachable'));
     expect(await toolNames(client)).toEqual(['save_note']);
     expect(text(await client.callTool({ name: 'save_note', arguments: {} }))).toBe('save_note done');

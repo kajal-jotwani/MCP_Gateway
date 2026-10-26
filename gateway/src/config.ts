@@ -6,6 +6,8 @@ import { SLUG_PATTERN } from './upstreams.js';
 
 export interface GatewayConfig {
   port: number;
+  /** Serves Prometheus metrics, apart from the port the Ingress routes to. */
+  metricsPort: number;
   /** Where people reach the dashboard and /mcp, such as http://app.localtest.me. Used in invite links. */
   publicUrl: URL;
   database: PostgresSettings;
@@ -56,6 +58,7 @@ const databaseEnv = {
 
 const envSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
+  METRICS_PORT: z.coerce.number().int().min(1).max(65535).default(9464),
   PUBLIC_URL: httpUrl,
   ...databaseEnv,
   BOOTSTRAP_ADMIN_EMAIL: z.email(),
@@ -108,6 +111,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): GatewayConfig {
   const vars = parseEnv(envSchema, env);
   return {
     port: vars.PORT,
+    metricsPort: vars.METRICS_PORT,
     publicUrl: new URL(vars.PUBLIC_URL),
     database: databaseSettings(vars),
     firstAdmin: { email: vars.BOOTSTRAP_ADMIN_EMAIL, password: vars.BOOTSTRAP_ADMIN_PASSWORD },

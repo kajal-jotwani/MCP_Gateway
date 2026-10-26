@@ -40,6 +40,11 @@ ingress:
   # Where the controller's pods run. The NetworkPolicies let only this namespace reach the gateway.
   controllerNamespace: kube-system
 
+metrics:
+  # A namespace whose pods may scrape the gateway's Prometheus metrics on port 9464, such as
+  # monitoring. Empty: only `kubectl port-forward` reaches them.
+  scrapeNamespace: ''
+
 storage:
   className: local-path
   postgresSize: 1Gi

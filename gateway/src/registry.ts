@@ -26,6 +26,7 @@ export interface UpstreamConfig {
 }
 
 export interface UpstreamState {
+  slug: string;
   status: UpstreamStatus;
   /** Why the upstream is unreachable, with no URL or credential in it. */
   error?: string;
@@ -43,6 +44,7 @@ export interface RegistryTimeouts {
 /** A tool the gateway can route, with the upstream name that error messages and audit entries use. */
 export interface RoutedTool extends ExposedTool {
   upstreamName: string;
+  upstreamSlug: string;
 }
 
 /** A failed upstream call. The message is safe to show to clients and to the model. */
@@ -159,7 +161,13 @@ export class UpstreamRegistry {
     return new Map(
       [...this.connections.values()].map(({ config, status, error, checkedAt }) => [
         config.id,
-        { status, error, checkedAt, tools: tools.filter((tool) => tool.upstreamId === config.id) },
+        {
+          slug: config.slug,
+          status,
+          error,
+          checkedAt,
+          tools: tools.filter((tool) => tool.upstreamId === config.id),
+        },
       ]),
     );
   }
@@ -177,7 +185,7 @@ export class UpstreamRegistry {
     const connection = this.connections.get(tool.upstreamId);
     const client = connection?.client;
     if (!connection || !client || connection.status !== 'connected') {
-      throw new UpstreamCallError('failed', `Upstream "${tool.upstreamName}" is unreachable.`);
+      throw new UpstreamCallError('failed', unreachableMessage(tool.upstreamName, connection?.error));
     }
     let result: CallToolResult;
     try {
@@ -322,13 +330,14 @@ export class UpstreamRegistry {
       if (this.isCurrent(connection)) void this.refresh(connection);
       return new UpstreamCallError('failed', `Upstream "${upstreamName}" answered HTTP ${error.status}.`);
     }
+    const reason = describeFailure(error);
     if (connection.client === client && this.isCurrent(connection)) {
       this.disconnect(connection);
-      this.setStatus(connection, 'unreachable', describeFailure(error), Date.now());
+      this.setStatus(connection, 'unreachable', reason, Date.now());
       connection.checkedAt = new Date();
       this.publish();
     }
-    return new UpstreamCallError('failed', `Upstream "${upstreamName}" is unreachable.`);
+    return new UpstreamCallError('failed', unreachableMessage(upstreamName, reason));
   }
 
   private isCurrent(connection: Connection): boolean {
@@ -376,7 +385,7 @@ export class UpstreamRegistry {
   /** Recomputes exposed names and notifies listeners when the tools clients can see changed. */
   private publish(): void {
     const enabled = [...this.connections.values()].filter((connection) => connection.config.enabled);
-    const names = new Map(enabled.map(({ config }) => [config.id, config.name]));
+    const configs = new Map(enabled.map(({ config }) => [config.id, config]));
     const exposed = exposeToolNames(
       enabled.map(({ config, tools }) => ({
         upstreamId: config.id,
@@ -384,7 +393,11 @@ export class UpstreamRegistry {
         alwaysPrefix: config.storeId !== undefined,
         tools,
       })),
-    ).map((tool) => ({ ...tool, upstreamName: names.get(tool.upstreamId) ?? '' }));
+    ).map((tool) => ({
+      ...tool,
+      upstreamName: configs.get(tool.upstreamId)!.name,
+      upstreamSlug: configs.get(tool.upstreamId)!.slug,
+    }));
     const connected = new Set(enabled.filter((c) => c.status === 'connected').map((c) => c.config.id));
 
     this.routable = new Map(exposed.map((tool) => [tool.name, tool]));
@@ -403,6 +416,12 @@ function endpointChanged(previous: UpstreamConfig, next: UpstreamConfig): boolea
     previous.credential?.header !== next.credential?.header ||
     previous.credential?.value !== next.credential?.value
   );
+}
+
+function unreachableMessage(upstreamName: string, reason: string | undefined): string {
+  return reason
+    ? `Upstream "${upstreamName}" is unreachable: ${reason}.`
+    : `Upstream "${upstreamName}" is unreachable.`;
 }
 
 /** Keeps only the fields clients need from an upstream tool definition, with a capped description. */
@@ -428,14 +447,54 @@ function forwardedResult(result: CallToolResult, upstreamName: string): CallTool
   return forwarded;
 }
 
-/** A short reason for the dashboard and logs. Never includes URLs, headers or credentials. */
-function describeFailure(error: unknown): string {
-  if (error instanceof SdkHttpError) {
-    return error.status === 401 || error.status === 403
-      ? `rejected the gateway's credential (HTTP ${error.status})`
-      : `HTTP ${error.status}`;
+// Node and undici error codes that name a network failure, with the reason the dashboard shows.
+const NETWORK_FAILURES: Record<string, string> = {
+  ENOTFOUND: 'DNS lookup failed (the host name does not exist)',
+  EAI_AGAIN: 'DNS lookup failed (the DNS server did not answer)',
+  ECONNREFUSED: 'connection refused (nothing is listening on that port)',
+  ECONNRESET: 'the connection was reset',
+  UND_ERR_SOCKET: 'the connection was closed unexpectedly',
+  ETIMEDOUT: 'connecting timed out',
+  UND_ERR_CONNECT_TIMEOUT: 'connecting timed out',
+  EHOSTUNREACH: 'the host is unreachable',
+  ENETUNREACH: 'the network is unreachable',
+};
+
+function causesOf(error: unknown): unknown[] {
+  const chain: unknown[] = [];
+  // Bounded, because a cause chain can be cyclic.
+  for (let cause = error; cause !== undefined && chain.length < 8; cause = (cause as Error).cause) {
+    chain.push(cause);
   }
-  if (error instanceof SdkError && error.code === SdkErrorCode.RequestTimeout) return 'timed out';
-  if (error instanceof ProtocolError) return `protocol error ${error.code}`;
+  return chain;
+}
+
+/**
+ * A short reason for the dashboard and logs, from the first cause in the error's chain that says
+ * something specific. Never includes URLs, host names, headers or credentials.
+ */
+export function describeFailure(error: unknown): string {
+  for (const cause of causesOf(error)) {
+    if (cause instanceof SdkHttpError) {
+      return cause.status === 401 || cause.status === 403
+        ? `rejected the gateway's credential (HTTP ${cause.status})`
+        : `HTTP ${cause.status}`;
+    }
+    if (cause instanceof SdkError && cause.code === SdkErrorCode.RequestTimeout) return 'timed out';
+    if (cause instanceof SdkError && cause.code === SdkErrorCode.ClientHttpUnexpectedContent) {
+      return 'the server did not answer as an MCP server (unexpected content type)';
+    }
+    if (cause instanceof ProtocolError) return `protocol error ${cause.code}`;
+    if (!(cause instanceof Error)) continue;
+    if (cause.message === 'unexpected redirect') {
+      return 'the server answered with a redirect, which the gateway does not follow';
+    }
+    const code = (cause as { code?: unknown }).code;
+    if (typeof code !== 'string') continue;
+    if (NETWORK_FAILURES[code]) return NETWORK_FAILURES[code];
+    if (/^(ERR_SSL_|ERR_TLS_|CERT_|DEPTH_ZERO_|SELF_SIGNED_|UNABLE_TO_)/.test(code)) {
+      return `the TLS handshake failed (${code})`;
+    }
+  }
   return 'connection failed';
 }

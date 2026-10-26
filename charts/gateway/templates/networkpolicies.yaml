@@ -29,6 +29,14 @@ spec:
               kubernetes.io/metadata.name: {{ .Values.ingress.controllerNamespace }}
       ports:
         - port: http
+    {{- with .Values.metrics.scrapeNamespace }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+      ports:
+        - port: metrics
+    {{- end }}
 ---
 # The database answers the gateway and the provisioner only, and the bundled upstreams the gateway
 # only, so nothing in the cluster can reach them around the gateway's API-key checks and audit.

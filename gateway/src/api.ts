@@ -5,7 +5,8 @@ import * as z from 'zod/v4';
 import type Anthropic from '@anthropic-ai/sdk';
 
 import { createApiKey, getApiKey, listApiKeys, revokeApiKey } from './apiKeys.js';
-import { listAuditEntries } from './audit.js';
+import { listAuditEntries, upstreamCallStats } from './audit.js';
+import type { UpstreamCallStats } from './audit.js';
 import { chatFailureMessage, runChatTurn } from './chat.js';
 import type { ChatEvent, ChatTurn } from './chat.js';
 import type { Database } from './db.js';
@@ -229,15 +230,30 @@ function requireCustomHeader(req: Request, _res: Response, next: NextFunction): 
   next();
 }
 
+// The period of the per-server call statistics on the Servers page.
+const STATS_HOURS = 24;
+const NO_CALLS: UpstreamCallStats = {
+  calls: 0,
+  errors: 0,
+  timedOut: 0,
+  rejected: 0,
+  p50Ms: null,
+  p95Ms: null,
+};
+
 /**
- * An upstream with its live status and tools. Members get no URL or credential details, since they
- * only need to know which tools exist.
+ * An upstream with its live status and tools. Members get no URL, credential details or call
+ * statistics, since they only need to know which tools exist.
  */
-function upstreamView(upstream: Upstream, state: UpstreamState | undefined, admin: boolean) {
+function upstreamView(
+  upstream: Upstream,
+  state: UpstreamState | undefined,
+  forAdmin: { stats: UpstreamCallStats | undefined } | undefined,
+) {
   const { url, authType, authHeaderName, ...visible } = upstream;
   return {
     ...visible,
-    ...(admin && { url, authType, authHeaderName }),
+    ...(forAdmin && { url, authType, authHeaderName, stats: forAdmin.stats ?? NO_CALLS }),
     status: state?.status ?? (upstream.enabled ? 'unreachable' : 'disabled'),
     error: state?.error ?? null,
     checkedAt: state?.checkedAt ?? null,
@@ -278,8 +294,10 @@ export function createApiRouter({ db, registry, anthropic, publicUrl, stores }: 
   const secureCookie = publicUrl.protocol === 'https:';
 
   const applyUpstreamChanges = (): Promise<void> => registry.reload(() => listUpstreamConfigs(db));
-  const upstreamResponse = (upstream: Upstream) => ({
-    upstream: upstreamView(upstream, registry.states().get(upstream.id), true),
+  const upstreamResponse = async (upstream: Upstream) => ({
+    upstream: upstreamView(upstream, registry.states().get(upstream.id), {
+      stats: (await upstreamCallStats(db, STATS_HOURS)).get(upstream.id),
+    }),
   });
 
   const startSession = async (res: Response, member: Member): Promise<void> => {
@@ -413,8 +431,12 @@ export function createApiRouter({ db, registry, anthropic, publicUrl, stores }: 
     const admin = isAdmin(signedInMember(res));
     const states = registry.states();
     const upstreams = await listUpstreams(db);
+    // Statistics count every member's calls, so only admins get them, as with the full audit log.
+    const stats = admin ? await upstreamCallStats(db, STATS_HOURS) : undefined;
     res.json({
-      upstreams: upstreams.map((upstream) => upstreamView(upstream, states.get(upstream.id), admin)),
+      upstreams: upstreams.map((upstream) =>
+        upstreamView(upstream, states.get(upstream.id), stats && { stats: stats.get(upstream.id) }),
+      ),
     });
   });
 
@@ -429,7 +451,7 @@ export function createApiRouter({ db, registry, anthropic, publicUrl, stores }: 
     const created = await createUpstream(db, { ...input, slug: derivedSlug });
     if (typeof created === 'string') throw upstreamChangeRefusal(created);
     await applyUpstreamChanges();
-    res.status(201).json(upstreamResponse(created));
+    res.status(201).json(await upstreamResponse(created));
   });
 
   router.patch('/upstreams/:id', async (req, res) => {
@@ -439,7 +461,7 @@ export function createApiRouter({ db, registry, anthropic, publicUrl, stores }: 
     if (!updated) throw new HttpError(404, 'Not found.');
     if (typeof updated === 'string') throw upstreamChangeRefusal(updated);
     await applyUpstreamChanges();
-    res.json(upstreamResponse(updated));
+    res.json(await upstreamResponse(updated));
   });
 
   router.delete('/upstreams/:id', async (req, res) => {

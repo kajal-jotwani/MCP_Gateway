@@ -12,6 +12,7 @@ import type { RejectedKey } from './apiKeys.js';
 import { writeAuditEntry } from './audit.js';
 import type { Queryable } from './db.js';
 import { callerAuthInfo } from './mcpEndpoint.js';
+import { recordToolCall } from './metrics.js';
 import type { Caller } from './toolCalls.js';
 
 export interface AppDeps extends ApiDeps {
@@ -85,6 +86,9 @@ async function rejectMcpRequest(
   const requests = jsonRpcRequestsIn(req.body);
   for (const request of requests) {
     const tool = request.method === 'tools/call' ? request.params?.name : undefined;
+    if (request.method === 'tools/call') {
+      recordToolCall({ upstream: undefined, outcome: 'rejected', via: 'mcp', durationMs: 0 });
+    }
     await writeAuditEntry(db, {
       memberId: 'memberId' in rejection ? rejection.memberId : undefined,
       keyPrefix: key ? displayPrefixOf(key) : undefined,

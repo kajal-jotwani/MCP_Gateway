@@ -201,6 +201,17 @@ Each tool call is shown under the answer with its arguments and result, and is r
 
 **Audit log** lists every tool call, newest first: time, member, whether it came from an MCP client or the chat, server, tool, outcome (succeeded, failed, timed out, rejected), duration and reason. Rejected requests are included, such as a call with a revoked key, which is listed under the key's owner. Admins see everyone's calls; members see their own.
 
+### Metrics
+
+The Servers page shows each server's calls, error rate and latency for the last 24 hours (admins only). Each gateway pod also serves Prometheus metrics on port 9464, which the Ingress does not route:
+
+```sh
+kubectl -n gateway port-forward deploy/gateway 9464 &
+curl -s localhost:9464/metrics | grep '^gateway_'
+```
+
+To let a Prometheus in another namespace scrape the pods, set `metrics.scrapeNamespace` to that namespace.
+
 ### Show a name collision
 
 Add Notes a second time on the Servers page, with slug `notes2`, the same URL and token. All three notes tools on both entries become `notes__...` and `notes2__...`, and calls go to the right one. Remove the copy and the plain names come back.
