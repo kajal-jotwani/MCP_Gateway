@@ -201,6 +201,10 @@ Each tool call is shown under the answer with its arguments and result, and is r
 
 **Audit log** lists every tool call, newest first: time, member, whether it came from an MCP client or the chat, server, tool, outcome (succeeded, failed, timed out, rejected), duration and reason. Rejected requests are included, such as a call with a revoked key, which is listed under the key's owner. Admins see everyone's calls; members see their own.
 
+### Limit tools to admins
+
+On the Servers page, an admin can tick **Admins only** for a whole server or for single tools, for example `create_product` and `update_order_status` on WooCommerce. Members then no longer see those tools in their MCP client (after it lists tools again) or in the chat, and a direct call is rejected and shows as `rejected` in the audit log. Admins keep every tool.
+
 ### Metrics
 
 The Servers page shows each server's calls, error rate and latency for the last 24 hours (admins only). Each gateway pod also serves Prometheus metrics on port 9464, which the Ingress does not route:

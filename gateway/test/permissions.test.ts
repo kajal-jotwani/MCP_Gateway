@@ -3,10 +3,12 @@ import { describe, expect, it } from 'vitest';
 import {
   auditScopeOf,
   isAdmin,
+  mayCallTool,
   mayManageKeysOf,
   mayManageStoreOf,
   mayUseTools,
   memberChangeRefusal,
+  toolKey,
 } from '../src/permissions.js';
 import type { Member } from '../src/team.js';
 
@@ -19,6 +21,22 @@ describe('permissions', () => {
     expect(mayUseTools(admin)).toBe(true);
     expect(mayUseTools(member)).toBe(true);
     expect(mayUseTools({ ...member, active: false })).toBe(false);
+  });
+
+  it('lets members call tools unless the tool or its server is admin-only, and admins call all', () => {
+    const tool = { upstreamId: 'u1', originalName: 'create_product' };
+    const none = { adminOnlyUpstreams: new Set<string>(), adminOnlyTools: new Set<string>() };
+    const toolOnly = { ...none, adminOnlyTools: new Set([toolKey('u1', 'create_product')]) };
+    const server = { ...none, adminOnlyUpstreams: new Set(['u1']) };
+
+    expect(mayCallTool(member, tool, none)).toBe(true);
+    expect(mayCallTool(member, tool, toolOnly)).toBe(false);
+    expect(mayCallTool(member, { ...tool, originalName: 'list_orders' }, toolOnly)).toBe(true);
+    expect(mayCallTool(member, { ...tool, upstreamId: 'u2' }, toolOnly)).toBe(true);
+    expect(mayCallTool(member, tool, server)).toBe(false);
+    expect(mayCallTool(admin, tool, server)).toBe(true);
+    expect(mayCallTool(admin, tool, toolOnly)).toBe(true);
+    expect(mayCallTool(inactiveAdmin, tool, none)).toBe(false);
   });
 
   it('treats only active admins as admins', () => {

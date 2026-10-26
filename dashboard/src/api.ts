@@ -35,6 +35,8 @@ export interface UpstreamTool {
   originalName: string;
   title: string | null;
   description: string | null;
+  /** Sent to admins only: members cannot see or call the tool. */
+  adminOnly?: boolean;
 }
 
 /** Calls to one server in the last 24 hours. */
@@ -47,7 +49,7 @@ export interface UpstreamStats {
   p95Ms: number | null;
 }
 
-/** An upstream server. url, authType, authHeaderName and stats are only sent to admins. */
+/** An upstream server. url, authType, authHeaderName, stats and adminOnly are only sent to admins. */
 export interface Upstream {
   id: string;
   slug: string;
@@ -57,6 +59,8 @@ export interface Upstream {
   authType?: AuthType;
   authHeaderName?: string | null;
   stats?: UpstreamStats;
+  /** Sent to admins only: members cannot see the server or call its tools. */
+  adminOnly?: boolean;
   status: UpstreamStatus;
   error: string | null;
   checkedAt: string | null;
@@ -114,7 +118,7 @@ export class ApiError extends Error {
   }
 }
 
-type Method = 'GET' | 'POST' | 'PATCH' | 'DELETE';
+type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
 /**
  * Sends a request to the gateway's dashboard API with the session cookie and the header its CSRF

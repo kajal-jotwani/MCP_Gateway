@@ -96,6 +96,19 @@ function ServerCard({
       await api('PATCH', `/upstreams/${upstream.id}`, { enabled });
       onChanged();
     });
+  const setAccess = (access: { adminOnly: boolean; adminOnlyTools: string[] }) =>
+    run(async () => {
+      await api('PUT', `/upstreams/${upstream.id}/access`, access);
+      onChanged();
+    });
+  const adminOnlyTools = upstream.tools.filter((tool) => tool.adminOnly).map((tool) => tool.originalName);
+  const setToolAdminOnly = (tool: UpstreamTool, adminOnly: boolean) =>
+    setAccess({
+      adminOnly: upstream.adminOnly ?? false,
+      adminOnlyTools: adminOnly
+        ? [...adminOnlyTools, tool.originalName]
+        : adminOnlyTools.filter((name) => name !== tool.originalName),
+    });
   const remove = () => {
     if (!window.confirm(`Remove ${upstream.name}? Its tools disappear for every member and client.`)) return;
     void run(async () => {
@@ -153,6 +166,17 @@ function ServerCard({
           {busy && <span className="muted">Saving and reconnecting…</span>}
         </div>
       )}
+      {isAdmin && (
+        <label className="inline">
+          <input
+            type="checkbox"
+            checked={upstream.adminOnly ?? false}
+            disabled={busy}
+            onChange={(e) => void setAccess({ adminOnly: e.target.checked, adminOnlyTools })}
+          />
+          Admins only: members do not see this server or its tools
+        </label>
+      )}
       <ErrorText message={error} />
       {upstream.tools.length > 0 && (
         // Long lists start folded so the page stays scannable with several servers.
@@ -167,6 +191,7 @@ function ServerCard({
               <tr>
                 <th>Tool</th>
                 <th>Description</th>
+                {isAdmin && <th>Admins only</th>}
               </tr>
             </thead>
             <tbody>
@@ -179,6 +204,17 @@ function ServerCard({
                     )}
                   </td>
                   <td className="description">{tool.description}</td>
+                  {isAdmin && (
+                    <td>
+                      <input
+                        type="checkbox"
+                        aria-label={`Only admins may call ${tool.name}`}
+                        checked={tool.adminOnly ?? false}
+                        disabled={busy}
+                        onChange={(e) => void setToolAdminOnly(tool, e.target.checked)}
+                      />
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>

@@ -2,7 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import type { CallToolResult } from '@modelcontextprotocol/client';
 
 import type { Member } from './team.js';
-import { callTool } from './toolCalls.js';
+import { callTool, toolsFor } from './toolCalls.js';
 import type { ToolCallDeps } from './toolCalls.js';
 
 export const CHAT_MODEL = 'claude-haiku-5-5';
@@ -99,7 +99,7 @@ export async function runChatTurn(
 ): Promise<void> {
   // The tool list is fixed for the whole turn: changing it between rounds would invalidate the
   // turn's thinking blocks. A tool disabled meanwhile fails in callTool with a clear error.
-  const tools: Anthropic.Tool[] = deps.registry.listTools().map(({ name, tool }) => ({
+  const tools: Anthropic.Tool[] = (await toolsFor(deps, member)).map(({ name, tool }) => ({
     name,
     description: tool.description,
     input_schema: tool.inputSchema,

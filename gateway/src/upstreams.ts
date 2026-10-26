@@ -1,4 +1,6 @@
 import type { Database, Queryable } from './db.js';
+import { toolKey } from './permissions.js';
+import type { ToolRestrictions } from './permissions.js';
 import type { UpstreamConfig } from './registry.js';
 
 export type AuthType = 'none' | 'bearer' | 'header';
@@ -179,6 +181,44 @@ export async function deleteUpstream(db: Queryable, id: string): Promise<boolean
     return true;
   }
   return (await db.query('SELECT 1 FROM upstreams WHERE id = $1', [id])).length > 0 ? 'store_managed' : false;
+}
+
+/** The admin-only servers and tools. Read on every listing and call, so a change applies at once. */
+export async function loadToolRestrictions(db: Queryable): Promise<ToolRestrictions> {
+  const [upstreams, tools] = await Promise.all([
+    db.query<{ id: string }>('SELECT id FROM upstreams WHERE admin_only'),
+    db.query<{ upstreamId: string; tool: string }>(
+      'SELECT upstream_id AS "upstreamId", tool FROM admin_only_tools',
+    ),
+  ]);
+  return {
+    adminOnlyUpstreams: new Set(upstreams.map((row) => row.id)),
+    adminOnlyTools: new Set(tools.map((row) => toolKey(row.upstreamId, row.tool))),
+  };
+}
+
+/**
+ * Sets whether an upstream is admin-only and which of its tools, by upstream tool name, are.
+ * Replaces the previous tool list. Returns false for an unknown upstream.
+ */
+export async function setUpstreamAccess(
+  db: Database,
+  id: string,
+  access: { adminOnly: boolean; adminOnlyTools: string[] },
+): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    const updated = await tx.query('UPDATE upstreams SET admin_only = $2 WHERE id = $1 RETURNING id', [
+      id,
+      access.adminOnly,
+    ]);
+    if (updated.length === 0) return false;
+    await tx.query('DELETE FROM admin_only_tools WHERE upstream_id = $1', [id]);
+    await tx.query(
+      'INSERT INTO admin_only_tools (upstream_id, tool) SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING',
+      [id, access.adminOnlyTools],
+    );
+    return true;
+  });
 }
 
 /**

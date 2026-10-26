@@ -4,10 +4,11 @@ import { writeAuditEntry } from './audit.js';
 import type { AuditEntryInput, Via } from './audit.js';
 import type { Queryable } from './db.js';
 import { recordToolCall } from './metrics.js';
-import { mayUseTools } from './permissions.js';
+import { mayCallTool, mayUseTools } from './permissions.js';
 import { UpstreamCallError } from './registry.js';
-import type { UpstreamRegistry } from './registry.js';
+import type { RoutedTool, UpstreamRegistry } from './registry.js';
 import type { Member } from './team.js';
+import { loadToolRestrictions } from './upstreams.js';
 
 /** Who is calling: the member, and whether through an API key on /mcp or the chat agent. */
 export interface Caller {
@@ -37,8 +38,17 @@ function toolError(message: string): CallToolResult {
 }
 
 /**
+ * The tools a member may see and call now, sorted by name: those of connected upstreams minus the
+ * admin-only ones. tools/list and the chat agent both list through here.
+ */
+export async function toolsFor(deps: ToolCallDeps, member: Member): Promise<RoutedTool[]> {
+  const restrictions = await loadToolRestrictions(deps.db);
+  return deps.registry.listTools().filter((tool) => mayCallTool(member, tool, restrictions));
+}
+
+/**
  * The one path every tool call takes, from MCP clients and from the chat agent: authorize the member,
- * route the name to its upstream, call it, and write an audit entry whatever happened. Rejections and
+ * route the name to its upstream, check the tool's permissions, call it, and write an audit entry whatever happened. Rejections and
  * upstream failures come back as tool errors, so the model can read them and recover.
  */
 export async function callTool(deps: ToolCallDeps, caller: Caller, call: ToolCall): Promise<CallToolResult> {
@@ -50,7 +60,7 @@ export async function callTool(deps: ToolCallDeps, caller: Caller, call: ToolCal
     tool: call.name.slice(0, 128),
   };
   try {
-    const run = await runToolCall(deps.registry, caller, call);
+    const run = await runToolCall(deps, caller, call);
     outcome = run.outcome;
     return run.result;
   } finally {
@@ -68,7 +78,7 @@ export async function callTool(deps: ToolCallDeps, caller: Caller, call: ToolCal
 }
 
 async function runToolCall(
-  registry: UpstreamRegistry,
+  { db, registry }: ToolCallDeps,
   caller: Caller,
   call: ToolCall,
 ): Promise<{ result: CallToolResult; outcome: Outcome }> {
@@ -90,6 +100,10 @@ async function runToolCall(
     upstreamSlug: tool.upstreamSlug,
     tool: tool.originalName,
   };
+  if (!mayCallTool(caller.member, tool, await loadToolRestrictions(db))) {
+    const reason = 'Only admins may call this tool.';
+    return { result: toolError(reason), outcome: { ...target, outcome: 'rejected', reason } };
+  }
   try {
     const result = await registry.callTool(tool, call.arguments, call.signal);
     return result.isError

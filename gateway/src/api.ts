@@ -10,7 +10,15 @@ import type { UpstreamCallStats } from './audit.js';
 import { chatFailureMessage, runChatTurn } from './chat.js';
 import type { ChatEvent, ChatTurn } from './chat.js';
 import type { Database } from './db.js';
-import { auditScopeOf, isAdmin, mayManageKeysOf, mayManageStoreOf } from './permissions.js';
+import {
+  auditScopeOf,
+  isAdmin,
+  mayCallTool,
+  mayManageKeysOf,
+  mayManageStoreOf,
+  toolKey,
+} from './permissions.js';
+import type { ToolRestrictions } from './permissions.js';
 import type { UpstreamRegistry, UpstreamState } from './registry.js';
 import {
   createStore,
@@ -44,6 +52,8 @@ import {
   deleteUpstream,
   listUpstreamConfigs,
   listUpstreams,
+  loadToolRestrictions,
+  setUpstreamAccess,
   SLUG_PATTERN,
   slugFromName,
   updateUpstream,
@@ -163,6 +173,12 @@ const upstreamPatchBody = z.object({
   enabled: z.boolean().optional(),
 });
 
+const accessBody = z.object({
+  adminOnly: z.boolean(),
+  // Upstream tool names, as listed in originalName.
+  adminOnlyTools: z.array(z.string().min(1).max(128)).max(1000),
+});
+
 const storeBody = z.object({
   name: z
     .string()
@@ -242,27 +258,42 @@ const NO_CALLS: UpstreamCallStats = {
 };
 
 /**
- * An upstream with its live status and tools. Members get no URL, credential details or call
- * statistics, since they only need to know which tools exist.
+ * An upstream with its live status and tools. Members get no URL, credential details, call
+ * statistics or permissions, and only the tools they may call, since they only need to know which
+ * tools they can use.
  */
 function upstreamView(
   upstream: Upstream,
   state: UpstreamState | undefined,
-  forAdmin: { stats: UpstreamCallStats | undefined } | undefined,
+  viewer: Member,
+  restrictions: ToolRestrictions,
+  stats: UpstreamCallStats | undefined,
 ) {
   const { url, authType, authHeaderName, ...visible } = upstream;
+  const admin = isAdmin(viewer);
   return {
     ...visible,
-    ...(forAdmin && { url, authType, authHeaderName, stats: forAdmin.stats ?? NO_CALLS }),
+    ...(admin && {
+      url,
+      authType,
+      authHeaderName,
+      stats: stats ?? NO_CALLS,
+      adminOnly: restrictions.adminOnlyUpstreams.has(upstream.id),
+    }),
     status: state?.status ?? (upstream.enabled ? 'unreachable' : 'disabled'),
     error: state?.error ?? null,
     checkedAt: state?.checkedAt ?? null,
-    tools: (state?.tools ?? []).map(({ name, originalName, tool }) => ({
-      name,
-      originalName,
-      title: tool.title ?? null,
-      description: tool.description ?? null,
-    })),
+    tools: (state?.tools ?? [])
+      .filter((tool) => mayCallTool(viewer, tool, restrictions))
+      .map(({ name, originalName, tool }) => ({
+        name,
+        originalName,
+        title: tool.title ?? null,
+        description: tool.description ?? null,
+        ...(admin && {
+          adminOnly: restrictions.adminOnlyTools.has(toolKey(upstream.id, originalName)),
+        }),
+      })),
   };
 }
 
@@ -294,10 +325,14 @@ export function createApiRouter({ db, registry, anthropic, publicUrl, stores }: 
   const secureCookie = publicUrl.protocol === 'https:';
 
   const applyUpstreamChanges = (): Promise<void> => registry.reload(() => listUpstreamConfigs(db));
-  const upstreamResponse = async (upstream: Upstream) => ({
-    upstream: upstreamView(upstream, registry.states().get(upstream.id), {
-      stats: (await upstreamCallStats(db, STATS_HOURS)).get(upstream.id),
-    }),
+  const upstreamResponse = async (upstream: Upstream, admin: Member) => ({
+    upstream: upstreamView(
+      upstream,
+      registry.states().get(upstream.id),
+      admin,
+      await loadToolRestrictions(db),
+      (await upstreamCallStats(db, STATS_HOURS)).get(upstream.id),
+    ),
   });
 
   const startSession = async (res: Response, member: Member): Promise<void> => {
@@ -428,21 +463,24 @@ export function createApiRouter({ db, registry, anthropic, publicUrl, stores }: 
   });
 
   router.get('/upstreams', async (_req, res) => {
-    const admin = isAdmin(signedInMember(res));
+    const viewer = signedInMember(res);
     const states = registry.states();
-    const upstreams = await listUpstreams(db);
+    const [upstreams, restrictions] = await Promise.all([listUpstreams(db), loadToolRestrictions(db)]);
     // Statistics count every member's calls, so only admins get them, as with the full audit log.
-    const stats = admin ? await upstreamCallStats(db, STATS_HOURS) : undefined;
+    const stats = isAdmin(viewer) ? await upstreamCallStats(db, STATS_HOURS) : new Map();
     res.json({
-      upstreams: upstreams.map((upstream) =>
-        upstreamView(upstream, states.get(upstream.id), stats && { stats: stats.get(upstream.id) }),
-      ),
+      upstreams: upstreams
+        // An admin-only server is hidden from members altogether, as its tools are.
+        .filter((upstream) => isAdmin(viewer) || !restrictions.adminOnlyUpstreams.has(upstream.id))
+        .map((upstream) =>
+          upstreamView(upstream, states.get(upstream.id), viewer, restrictions, stats.get(upstream.id)),
+        ),
     });
   });
 
   // Each change is applied to the registry before responding, so the response carries the new status.
   router.post('/upstreams', async (req, res) => {
-    signedInAdmin(res);
+    const admin = signedInAdmin(res);
     const { slug, ...input } = parse(upstreamBody, req.body);
     const derivedSlug = slug ?? slugFromName(input.name);
     if (!SLUG_PATTERN.test(derivedSlug)) {
@@ -451,17 +489,29 @@ export function createApiRouter({ db, registry, anthropic, publicUrl, stores }: 
     const created = await createUpstream(db, { ...input, slug: derivedSlug });
     if (typeof created === 'string') throw upstreamChangeRefusal(created);
     await applyUpstreamChanges();
-    res.status(201).json(await upstreamResponse(created));
+    res.status(201).json(await upstreamResponse(created, admin));
   });
 
   router.patch('/upstreams/:id', async (req, res) => {
-    signedInAdmin(res);
+    const admin = signedInAdmin(res);
     const changes = parse(upstreamPatchBody, req.body);
     const updated = await updateUpstream(db, parseId(req.params.id), changes);
     if (!updated) throw new HttpError(404, 'Not found.');
     if (typeof updated === 'string') throw upstreamChangeRefusal(updated);
     await applyUpstreamChanges();
-    res.json(await upstreamResponse(updated));
+    res.json(await upstreamResponse(updated, admin));
+  });
+
+  // Store upstreams can be restricted too: who may use a server is the admins' call, not the store's.
+  router.put('/upstreams/:id/access', async (req, res) => {
+    const admin = signedInAdmin(res);
+    const id = parseId(req.params.id);
+    if (!(await setUpstreamAccess(db, id, parse(accessBody, req.body))))
+      throw new HttpError(404, 'Not found.');
+    // The tool list is per member now, so listening clients list again.
+    registry.announceToolsChanged();
+    const upstream = (await listUpstreams(db)).find((candidate) => candidate.id === id)!;
+    res.json(await upstreamResponse(upstream, admin));
   });
 
   router.delete('/upstreams/:id', async (req, res) => {

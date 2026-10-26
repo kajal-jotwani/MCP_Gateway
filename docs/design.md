@@ -289,6 +289,21 @@ The gateway process does hold state in memory: the upstream clients, the tool ca
 
 Auth and audit would still be correct, because they read and write PostgreSQL on every request. The chart runs one replica; during a rolling update the old and new pods overlap for a few seconds, which the periodic re-read covers. Fixing the above would mean `LISTEN/NOTIFY` for admin changes and storing status in PostgreSQL; that is the scaling extension and out of scope.
 
+### Tool permissions
+
+Options considered: per-member allow lists, per-role rules, or scopes on API keys. The brief's example (members read orders, only admins create products or change order status) is a rule about roles, and the team has two roles, so a rule per role covers it without a policy language.
+
+**Decision:** an admin can make a whole server, or single tools of a server, **admins only**. Admins keep every tool; members neither see nor call admin-only ones.
+
+- Storage: `upstreams.admin_only` and a table `admin_only_tools (upstream_id, tool)`, where `tool` is the tool's name on its upstream, so the rule survives a gateway-side rename (a collision prefix, a slug change). Deleting the server deletes its rules. Nothing is admin-only by default, so existing setups and D1 to D9 behave as before.
+- One check, `mayCallTool(member, tool, restrictions)` in `permissions.ts`, pure and unit-tested. Listing goes through `toolsFor`, which filters the registry's tools with it, and both `tools/list` and the chat agent list through `toolsFor`. A call goes through the same check in the single call path after the name is routed, so a member who calls a hidden tool by name gets `Only admins may call this tool.`, and the call is audited as rejected with the server and tool.
+- The rules are read from PostgreSQL on every listing and call, one small query each, so a change applies to the next request on every replica, with no cache to invalidate.
+- A change sends `notifications/tools/list_changed`, so listening clients list again.
+- The Servers page has an "Admins only" switch per server and per tool for admins. Members do not see admin-only servers at all, and only their own tools on the others.
+- Store servers can be restricted too. A rule names one upstream, so restricting `create_product` on the original store does not restrict it on a provisioned store.
+
+Not done: per-member rules, and restrictions on tool arguments (for example "members may only set orders to completed").
+
 ### Observability
 
 Three views, each for a different reader:
@@ -356,7 +371,8 @@ members        id, email (unique), name, role (admin|member), password_hash, act
 sessions       id_hash, member_id, expires_at
 invites        id, token_hash (unique), email, role, created_by, expires_at
 api_keys       id, member_id, key_hash (unique), display_prefix, name, created_by, created_at, revoked_at, last_used_at
-upstreams      id, slug (unique), name, url, auth_type (none|bearer|header), auth_header_name, auth_secret, enabled, store_id (nullable, unique, deleted with its store), created_at, updated_at
+upstreams      id, slug (unique), name, url, auth_type (none|bearer|header), auth_header_name, auth_secret, enabled, admin_only, store_id (nullable, unique, deleted with its store), created_at, updated_at
+admin_only_tools  upstream_id (deleted with its upstream), tool (the upstream's tool name)
 stores         id, slug (unique, DNS label), name, url, owner_id, status (provisioning|ready|failed|deleting), reason, attempt, attempt_started_at, created_at, updated_at
 bootstrap      action, done_at
 audit_entries  id, at, member_id (nullable), key_prefix (nullable), via (mcp|chat), upstream_id (nullable, no foreign key), upstream_name, tool, duration_ms, outcome (succeeded|failed|timed_out|rejected), reason
@@ -413,6 +429,7 @@ Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and ever
 | T2 | `urk_` keys, SHA-256, revocation checked on every call |
 | T4, D9 | `writeAuditEntry` in the single tool-call path, audit page in the dashboard |
 | C1, C2, C3 | Claude Messages API loop in the gateway using the same path, tool calls streamed to the UI, key in a Secret |
+| Tool permissions | `upstreams.admin_only` and `admin_only_tools`; `mayCallTool` in listing (`toolsFor`) and in the single call path |
 | Observability | Failure reasons from the error cause chain; per-server stats from `audit_entries`; Prometheus `/metrics` on port 9464 |
 | Multi-store bonus | `stores` table and Stores page; provisioner running Helm per namespace `store-<slug>`; RBAC bound per store namespace plus an admission policy; quota, LimitRange, per-member limit and timeout; woo-mcp egress policy; store tools always `<slug>__<tool>` |
 

@@ -19,7 +19,7 @@ Each upstream has at most one static credential (a bearer token or a named heade
 
 What a member can do with it:
 
-- Call every tool that the credential allows on that upstream, as often as the gateway lets them. There is no per-tool permission and no rate limit, so a member can do anything the shared identity can do, including writes such as `create_product` and `update_order_status`.
+- Call every tool that the credential allows on that upstream and that an admin has not made admin-only, as often as the gateway lets them. By default nothing is admin-only, so a member can do anything the shared identity can do, including writes such as `create_product` and `update_order_status`, until an admin restricts those tools. A restriction applies to the gateway's tool, not to the credential: an upstream tool that can do the same thing as a restricted one (for example a generic `rest_request` tool) still can, so an admin restricts by what a tool can do, not by its name.
 - Act anonymously towards the upstream. The upstream sees the gateway's credential, not the member, so its own logs cannot tell members apart. The gateway's audit log is the only record of who made a call (user, server, tool, time, duration, outcome).
 
 What a member cannot do:

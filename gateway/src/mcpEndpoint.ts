@@ -1,7 +1,7 @@
 import { createMcpHandler, ProtocolError, ProtocolErrorCode, Server } from '@modelcontextprotocol/server';
 import type { AuthInfo, McpHttpHandler } from '@modelcontextprotocol/server';
 
-import { callTool } from './toolCalls.js';
+import { callTool, toolsFor } from './toolCalls.js';
 import type { Caller, ToolCallDeps } from './toolCalls.js';
 
 /** Wraps a verified caller as the AuthInfo that the MCP handler passes to each request's server. */
@@ -11,8 +11,8 @@ export function callerAuthInfo(caller: Caller): AuthInfo {
 }
 
 /**
- * Builds the gateway's MCP endpoint. tools/list returns the tools of every connected upstream from the
- * registry's state; tools/call goes through the shared call path as the authenticated caller. Each
+ * Builds the gateway's MCP endpoint. tools/list returns the caller's tools of every connected upstream
+ * from the registry's state; tools/call goes through the shared call path as the authenticated caller. Each
  * request gets a fresh server, so the endpoint holds no sessions. Clients listening for changes get
  * notifications/tools/list_changed.
  */
@@ -26,8 +26,8 @@ export function createGatewayMcpHandler(deps: ToolCallDeps): McpHttpHandler {
         { name: 'urumi-gateway', version: '1.0.0' },
         { capabilities: { tools: { listChanged: true } } },
       );
-      server.setRequestHandler('tools/list', () => ({
-        tools: deps.registry.listTools().map(({ name, tool }) => ({ ...tool, name })),
+      server.setRequestHandler('tools/list', async () => ({
+        tools: (await toolsFor(deps, caller.member)).map(({ name, tool }) => ({ ...tool, name })),
       }));
       server.setRequestHandler('tools/call', async (request, ctx) => {
         try {

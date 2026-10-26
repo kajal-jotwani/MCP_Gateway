@@ -95,6 +95,11 @@ export class UpstreamRegistry {
     this.toolsChangedListeners.push(listener);
   }
 
+  /** Runs the onToolsChanged listeners, for changes outside the registry such as tool permissions. */
+  announceToolsChanged(): void {
+    for (const listener of this.toolsChangedListeners) listener();
+  }
+
   /**
    * Loads the configured upstreams with `load` and syncs them. Reloads run one after another and each
    * loads when its turn comes, so overlapping admin changes and the refresh loop end on the latest rows.
@@ -405,7 +410,7 @@ export class UpstreamRegistry {
     const signature = JSON.stringify(this.visible);
     if (signature === this.visibleSignature) return;
     this.visibleSignature = signature;
-    for (const listener of this.toolsChangedListeners) listener();
+    this.announceToolsChanged();
   }
 }
 

@@ -767,6 +767,83 @@ describe('upstream servers', () => {
   });
 });
 
+describe('tool permissions', () => {
+  let isolated: Database;
+  beforeEach(async () => {
+    isolated = await isolatedDatabase();
+  });
+
+  async function restrict(gateway: Gateway, access: { adminOnly: boolean; adminOnlyTools: string[] }) {
+    const admin = await adminBrowser(gateway);
+    const [upstream] = (await admin.request('GET', '/upstreams')).body.upstreams as { id: string }[];
+    const response = await admin.request('PUT', `/upstreams/${upstream!.id}/access`, access);
+    expect(response.status).toBe(200);
+    return response.body.upstream as { adminOnly: boolean; tools: { name: string; adminOnly: boolean }[] };
+  }
+
+  it('hides an admin-only tool from members, rejects and audits a direct call, and keeps it for admins', async () => {
+    const gateway = await startGateway(isolated);
+    const updated = await restrict(gateway, { adminOnly: false, adminOnlyTools: ['fail'] });
+    expect(updated.tools).toContainEqual(expect.objectContaining({ name: 'fail', adminOnly: true }));
+    const member = await newMember('member', isolated);
+    const memberClient = await mcpClient(gateway, await newKey(isolated, member));
+    const adminClient = await mcpClient(gateway, await newKey(isolated, await newMember('admin', isolated)));
+
+    expect((await memberClient.listTools()).tools.map((tool) => tool.name)).toEqual(['list_orders', 'sleep']);
+    const rejected = await memberClient.callTool({ name: 'fail', arguments: {} });
+    expect(rejected.isError).toBe(true);
+    expect(text(rejected)).toBe('Only admins may call this tool.');
+    expect(gateway.upstream.calls).toEqual([]);
+    const [entry] = (await auditEntries(gateway)).filter((e) => e.memberId === member.id);
+    expect(entry).toMatchObject({
+      tool: 'fail',
+      outcome: 'rejected',
+      reason: 'Only admins may call this tool.',
+    });
+    expect(entry?.upstreamName).toBe('WooCommerce');
+
+    expect((await adminClient.listTools()).tools.map((tool) => tool.name)).toEqual([
+      'fail',
+      'list_orders',
+      'sleep',
+    ]);
+    expect((await adminClient.callTool({ name: 'fail', arguments: {} })).isError).toBe(true);
+    expect(gateway.upstream.calls.map((call) => call.tool)).toEqual(['fail']);
+
+    const memberView = (
+      await (await new Browser(gateway).login(member.email, PASSWORD)).request('GET', '/upstreams')
+    ).body.upstreams as { tools: { name: string }[] }[];
+    expect(memberView[0]!.tools.map((tool) => tool.name)).toEqual(['list_orders', 'sleep']);
+    expect(memberView[0]).not.toHaveProperty('adminOnly');
+  });
+
+  it('hides an admin-only server from members on the Servers page and in tools/list', async () => {
+    const gateway = await startGateway(isolated);
+    await restrict(gateway, { adminOnly: true, adminOnlyTools: [] });
+    const member = await newMember('member', isolated);
+    const client = await mcpClient(gateway, await newKey(isolated, member));
+
+    expect((await client.listTools()).tools).toEqual([]);
+    expect(text(await client.callTool({ name: 'list_orders', arguments: {} }))).toBe(
+      'Only admins may call this tool.',
+    );
+    const browser = await new Browser(gateway).login(member.email, PASSWORD);
+    expect((await browser.request('GET', '/upstreams')).body.upstreams).toEqual([]);
+
+    await restrict(gateway, { adminOnly: false, adminOnlyTools: [] });
+    expect((await client.listTools()).tools).toHaveLength(3);
+  });
+
+  it('only lets admins change permissions', async () => {
+    const gateway = await startGateway(isolated);
+    const [{ id }] = (await isolated.query<{ id: string }>('SELECT id FROM upstreams')) as [{ id: string }];
+    const member = await newMember('member', isolated);
+    const browser = await new Browser(gateway).login(member.email, PASSWORD);
+    const body = { adminOnly: false, adminOnlyTools: [] };
+    expect((await browser.request('PUT', `/upstreams/${id}/access`, body)).status).toBe(403);
+  });
+});
+
 describe('stores', () => {
   let isolated: Database;
   beforeEach(async () => {
@@ -938,6 +1015,25 @@ describe('chat agent', () => {
         { type: 'tool_result', tool_use_id: 'toolu_1_1', content: 'list_orders done', is_error: false },
       ],
     });
+  });
+
+  it('offers Claude only the tools the signed-in member may call', async () => {
+    const claude = await startFakeClaude([
+      { blocks: [{ type: 'text', text: 'Hi.' }], stopReason: 'end_turn' },
+    ]);
+    const isolated = await isolatedDatabase();
+    const gateway = await startGateway(isolated, claude.anthropic);
+    await isolated.query(
+      `INSERT INTO admin_only_tools (upstream_id, tool) SELECT id, 'sleep' FROM upstreams`,
+    );
+    const member = await newMember('member', isolated);
+
+    await (await new Browser(gateway).login(member.email, PASSWORD)).chat('Hello');
+
+    expect((claude.requests[0]?.body.tools as { name: string }[]).map((tool) => tool.name)).toEqual([
+      'fail',
+      'list_orders',
+    ]);
   });
 
   it('returns a rejected tool call to Claude as an error result and audits it', async () => {
