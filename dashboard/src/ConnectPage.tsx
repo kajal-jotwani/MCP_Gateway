@@ -37,6 +37,14 @@ export function ConnectPage() {
       </p>
       <CopyField label="Cursor configuration" value={cursorConfig} />
 
+      <h2>Many tools</h2>
+      <p className="muted">
+        With many servers, a client can use the search endpoint instead. It lists only two tools:{' '}
+        <code>search_tools</code> finds tools by keyword and <code>call_tool</code> runs one by name, with the
+        same permissions and audit log.
+      </p>
+      <CopyField label="Search endpoint" value={`${endpoint}/search`} />
+
       <h2>MCP Inspector</h2>
       <p className="muted">Lists the tools from a terminal, with the Inspector&apos;s command-line mode:</p>
       <CopyField

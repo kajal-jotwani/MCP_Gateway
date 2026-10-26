@@ -59,10 +59,12 @@ if (await seedUpstreamOnce(db, config.seedUpstream)) {
 
 const registry = new UpstreamRegistry(TIMEOUTS, createGuardedFetch(config.upstreamNetwork));
 const mcpHandler = createGatewayMcpHandler({ db, registry });
+const searchMcpHandler = createGatewayMcpHandler({ db, registry }, 'search');
 const app = createApp({
   db,
   registry,
   mcpHandler,
+  searchMcpHandler,
   anthropic: new Anthropic({ apiKey: config.anthropicApiKey }),
   publicUrl: config.publicUrl,
   stores: config.stores,
@@ -94,8 +96,7 @@ process.on('SIGTERM', () => {
   clearInterval(refreshTimer);
   server.close();
   metricsServer.close();
-  void mcpHandler
-    .close()
+  void Promise.all([mcpHandler.close(), searchMcpHandler.close()])
     .then(() => registry.close())
     .then(() => db.close());
 });

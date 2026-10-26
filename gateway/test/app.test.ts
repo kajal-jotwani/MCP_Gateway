@@ -12,7 +12,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { createApiKey } from '../src/apiKeys.js';
 import { createApp } from '../src/app.js';
 import type { AuditEntry } from '../src/audit.js';
-import { chatFailureMessage } from '../src/chat.js';
+import { CHAT_TOOL_LIMIT, chatFailureMessage } from '../src/chat.js';
 import type { ChatEvent } from '../src/chat.js';
 import type { Database } from '../src/db.js';
 import { createGatewayMcpHandler } from '../src/mcpEndpoint.js';
@@ -94,10 +94,12 @@ async function startGateway(
   const registry = new UpstreamRegistry({ connectMs: 500, listMs: 500, callMs: 300 });
   await registry.sync((await listUpstreamConfigs(database, cipher)).filter((config) => config.id === id));
   const mcpHandler = createGatewayMcpHandler({ db: database, registry });
+  const searchMcpHandler = createGatewayMcpHandler({ db: database, registry }, 'search');
   const app = createApp({
     db: database,
     registry,
     mcpHandler,
+    searchMcpHandler,
     anthropic,
     publicUrl: new URL('http://app.localtest.me'),
     stores: { domain: 'localtest.me', maxPerMember: 2 },
@@ -112,6 +114,7 @@ async function startGateway(
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
     await mcpHandler.close();
+    await searchMcpHandler.close();
     await registry.close();
   });
   return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, upstream };
@@ -189,13 +192,13 @@ async function adminBrowser(gateway: Gateway): Promise<Browser> {
   return new Browser(gateway).login(ADMIN.email, ADMIN.password);
 }
 
-async function mcpClient(gateway: Gateway, key: string | undefined): Promise<Client> {
+async function mcpClient(gateway: Gateway, key: string | undefined, path = '/mcp'): Promise<Client> {
   const client = new Client(
     { name: 'test-client', version: '1.0.0' },
     { versionNegotiation: { mode: 'auto' } },
   );
   await client.connect(
-    new StreamableHTTPClientTransport(new URL(`${gateway.url}/mcp`), {
+    new StreamableHTTPClientTransport(new URL(`${gateway.url}${path}`), {
       requestInit: { headers: key ? { authorization: `Bearer ${key}` } : {} },
     }),
   );
@@ -884,6 +887,49 @@ describe('tool permissions', () => {
   });
 });
 
+describe('tool search', () => {
+  it('serves search_tools and call_tool at /mcp/search, within the caller’s permissions and audited as the real tool', async () => {
+    const isolated = await isolatedDatabase();
+    const gateway = await startGateway(isolated);
+    await isolated.query(
+      `INSERT INTO admin_only_tools (upstream_id, tool) SELECT id, 'sleep' FROM upstreams`,
+    );
+    const member = await newMember('member', isolated);
+    const client = await mcpClient(gateway, await newKey(isolated, member), '/mcp/search');
+
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(['search_tools', 'call_tool']);
+    const found = await client.callTool({ name: 'search_tools', arguments: { query: 'orders' } });
+    expect(found.structuredContent).toEqual({
+      tools: [
+        expect.objectContaining({
+          name: 'list_orders',
+          server: 'WooCommerce',
+          description: 'list_orders tool',
+        }),
+      ],
+    });
+    const hidden = await client.callTool({ name: 'search_tools', arguments: { query: 'sleep' } });
+    expect(hidden.structuredContent).toEqual({ tools: [] });
+
+    const called = await client.callTool({
+      name: 'call_tool',
+      arguments: { name: 'list_orders', arguments: { after: 'x' } },
+    });
+    expect(text(called)).toBe('list_orders done');
+    expect(gateway.upstream.calls).toEqual([
+      { tool: 'list_orders', args: { after: 'x' }, authorization: undefined },
+    ]);
+    const refused = await client.callTool({ name: 'call_tool', arguments: { name: 'sleep' } });
+    expect(text(refused)).toBe('Only admins may call this tool.');
+    const entries = (await auditEntries(gateway)).filter((e) => e.memberId === member.id);
+    expect(entries.map((e) => [e.tool, e.outcome])).toEqual([
+      ['sleep', 'rejected'],
+      ['list_orders', 'succeeded'],
+    ]);
+    expect((await client.callTool({ name: 'search_tools', arguments: {} })).isError).toBe(true);
+  });
+});
+
 describe('stores', () => {
   let isolated: Database;
   beforeEach(async () => {
@@ -1074,6 +1120,43 @@ describe('chat agent', () => {
       'fail',
       'list_orders',
     ]);
+  });
+
+  it('gives Claude search_tools and call_tool when the member has more tools than fit', async () => {
+    const claude = await startFakeClaude([
+      {
+        blocks: [{ type: 'tool_use', name: 'search_tools', input: { query: 'orders' } }],
+        stopReason: 'tool_use',
+      },
+      {
+        blocks: [{ type: 'tool_use', name: 'call_tool', input: { name: 'list_orders', arguments: {} } }],
+        stopReason: 'tool_use',
+      },
+      { blocks: [{ type: 'text', text: 'No orders.' }], stopReason: 'end_turn' },
+    ]);
+    const isolated = await isolatedDatabase();
+    const gateway = await startGateway(isolated, claude.anthropic);
+    const many = await startUpstream(
+      Array.from({ length: CHAT_TOOL_LIMIT }, (_, index) => `report_${index}`),
+    );
+    const added = await (
+      await adminBrowser(gateway)
+    ).request('POST', '/upstreams', { name: 'Reports', url: many.url });
+    expect(added.status).toBe(201);
+    const member = await newMember('member', isolated);
+
+    const events = await (await new Browser(gateway).login(member.email, PASSWORD)).chat('Any orders?');
+
+    expect((claude.requests[0]?.body.tools as { name: string }[]).map((tool) => tool.name)).toEqual([
+      'search_tools',
+      'call_tool',
+    ]);
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'tool_call', name: 'call_tool', server: 'WooCommerce' }),
+    );
+    expect(gateway.upstream.calls.map((call) => call.tool)).toEqual(['list_orders']);
+    const [entry] = (await auditEntries(gateway)).filter((e) => e.memberId === member.id);
+    expect(entry).toMatchObject({ via: 'chat', tool: 'list_orders', outcome: 'succeeded' });
   });
 
   it('returns a rejected tool call to Claude as an error result and audits it', async () => {

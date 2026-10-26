@@ -2,6 +2,7 @@ import { createMcpHandler, ProtocolError, ProtocolErrorCode, Server } from '@mod
 import type { AuthInfo, McpHttpHandler } from '@modelcontextprotocol/server';
 
 import { callTool, toolsFor } from './toolCalls.js';
+import { META_TOOLS, runMetaTool } from './toolSearch.js';
 import type { Caller, ToolCallDeps } from './toolCalls.js';
 
 /** Wraps a verified caller as the AuthInfo that the MCP handler passes to each request's server. */
@@ -11,12 +12,13 @@ export function callerAuthInfo(caller: Caller): AuthInfo {
 }
 
 /**
- * Builds the gateway's MCP endpoint. tools/list returns the caller's tools of every connected upstream
- * from the registry's state; tools/call goes through the shared call path as the authenticated caller. Each
- * request gets a fresh server, so the endpoint holds no sessions. Clients listening for changes get
- * notifications/tools/list_changed.
+ * Builds the gateway's MCP endpoint. In 'all' mode tools/list returns the caller's tools of every
+ * connected upstream from the registry's state; in 'search' mode it returns search_tools and
+ * call_tool, for clients that cannot take hundreds of tools. tools/call goes through the shared call
+ * path as the authenticated caller either way. Each request gets a fresh server, so the endpoint holds
+ * no sessions. Clients listening for changes get notifications/tools/list_changed.
  */
-export function createGatewayMcpHandler(deps: ToolCallDeps): McpHttpHandler {
+export function createGatewayMcpHandler(deps: ToolCallDeps, mode: 'all' | 'search' = 'all'): McpHttpHandler {
   const handler = createMcpHandler(
     ({ authInfo }) => {
       const caller = authInfo?.extra?.caller as Caller | undefined;
@@ -27,11 +29,14 @@ export function createGatewayMcpHandler(deps: ToolCallDeps): McpHttpHandler {
         { capabilities: { tools: { listChanged: true } } },
       );
       server.setRequestHandler('tools/list', async () => ({
-        tools: (await toolsFor(deps, caller.member)).map(({ name, tool }) => ({ ...tool, name })),
+        tools:
+          mode === 'search'
+            ? META_TOOLS
+            : (await toolsFor(deps, caller.member)).map(({ name, tool }) => ({ ...tool, name })),
       }));
       server.setRequestHandler('tools/call', async (request, ctx) => {
         try {
-          return await callTool(deps, caller, {
+          return await (mode === 'search' ? runMetaTool : callTool)(deps, caller, {
             name: request.params.name,
             arguments: request.params.arguments ?? {},
             signal: ctx.mcpReq.signal,

@@ -176,6 +176,8 @@ In the second command, replace `YYYY-MM-DD` with today's date. `after` is in sto
 
 The client sees the tools of every enabled, connected server. Tool names are the servers' own (`list_orders`, `save_note`); only when two servers expose the same name are both renamed to `<slug>__<name>`, and the Servers page says why.
 
+With many servers, point the client at `http://app.localtest.me/mcp/search` instead. It lists two tools, `search_tools` (find tools by keyword, such as `orders` or `delhi orders`) and `call_tool` (run a found tool by name), so the client's context holds two definitions however many servers there are. Calls through `call_tool` are checked and audited as the tool they run. The chat agent switches to these two tools by itself when a member can use more than 40 tools.
+
 A revoked key gets HTTP 401 on its next request. MCP Inspector then reports `auth_required`, because it reads the 401 as a request to sign in with OAuth.
 
 ### Use the chat agent

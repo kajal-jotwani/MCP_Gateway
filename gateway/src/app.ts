@@ -17,6 +17,8 @@ import type { Caller } from './toolCalls.js';
 
 export interface AppDeps extends ApiDeps {
   mcpHandler: McpHttpHandler;
+  /** The same endpoint in search mode, served at /mcp/search. */
+  searchMcpHandler: McpHttpHandler;
   /** Absolute path of the built dashboard (dashboard/dist). */
   dashboardDir: string;
 }
@@ -135,7 +137,7 @@ function handleError(error: unknown, req: Request, res: Response, next: NextFunc
 }
 
 /**
- * The gateway's HTTP surface: /mcp for MCP clients with an API key, /api and the dashboard for people,
+ * The gateway's HTTP surface: /mcp and /mcp/search for MCP clients with an API key, /api and the dashboard for people,
  * and the probes. /readyz checks only the database, so a dead upstream never takes the gateway out of
  * service.
  */
@@ -155,15 +157,18 @@ export function createApp(deps: AppDeps): Express {
     res.type('text/plain').send('ok');
   });
 
-  const mcp = toNodeHandler(deps.mcpHandler, {
-    onerror: (error) => console.error(JSON.stringify({ event: 'mcp_error', message: error.message })),
-  });
-  app.all('/mcp', express.json({ limit: '4mb' }), async (req, res) => {
-    const key = bearerToken(req);
-    const caller = await authenticateMcpRequest(deps.db, key);
-    if ('rejected' in caller) return rejectMcpRequest(deps.db, req, res, key, caller);
-    await mcp(Object.assign(req, { auth: callerAuthInfo(caller) }), res, req.body);
-  });
+  const onerror = (error: Error) =>
+    console.error(JSON.stringify({ event: 'mcp_error', message: error.message }));
+  const mcpRoutes = { '/mcp': deps.mcpHandler, '/mcp/search': deps.searchMcpHandler };
+  for (const [path, handler] of Object.entries(mcpRoutes)) {
+    const mcp = toNodeHandler(handler, { onerror });
+    app.all(path, express.json({ limit: '4mb' }), async (req, res) => {
+      const key = bearerToken(req);
+      const caller = await authenticateMcpRequest(deps.db, key);
+      if ('rejected' in caller) return rejectMcpRequest(deps.db, req, res, key, caller);
+      await mcp(Object.assign(req, { auth: callerAuthInfo(caller) }), res, req.body);
+    });
+  }
 
   app.use('/api', createApiRouter(deps));
 

@@ -3,6 +3,7 @@ import type { CallToolResult } from '@modelcontextprotocol/client';
 
 import type { Member } from './team.js';
 import { callTool, toolsFor } from './toolCalls.js';
+import { META_TOOLS, runMetaTool } from './toolSearch.js';
 import type { ToolCallDeps } from './toolCalls.js';
 
 export const CHAT_MODEL = 'claude-haiku-5-5';
@@ -12,6 +13,9 @@ const MAX_TOKENS = 32_000;
 // Tool results are untrusted and can be large; this keeps one result from filling the context.
 const MAX_TOOL_RESULT_CHARS = 50_000;
 const TOOL_PREVIEW_CHARS = 2000;
+// Above this many tools, Claude gets search_tools and call_tool instead. Every definition is sent on
+// every request, and picking among hundreds of similar tools gets less reliable.
+export const CHAT_TOOL_LIMIT = 40;
 
 const SYSTEM_PROMPT = `You are the assistant in a team's MCP gateway dashboard. You help one signed-in team member by \
 answering questions and taking actions with the tools of the team's connected servers, such as a WooCommerce store.
@@ -99,7 +103,10 @@ export async function runChatTurn(
 ): Promise<void> {
   // The tool list is fixed for the whole turn: changing it between rounds would invalidate the
   // turn's thinking blocks. A tool disabled meanwhile fails in callTool with a clear error.
-  const tools: Anthropic.Tool[] = (await toolsFor(deps, member)).map(({ name, tool }) => ({
+  const available = await toolsFor(deps, member);
+  const searchMode = available.length > CHAT_TOOL_LIMIT;
+  const offered = searchMode ? META_TOOLS.map((tool) => ({ name: tool.name, tool })) : available;
+  const tools: Anthropic.Tool[] = offered.map(({ name, tool }) => ({
     name,
     description: tool.description,
     input_schema: tool.inputSchema,
@@ -145,18 +152,21 @@ export async function runChatTurn(
     // Parallel tool calls run together and their results go back in one message.
     const results = await Promise.all(
       toolUses.map(async (block): Promise<Anthropic.ToolResultBlockParam> => {
+        const args = toolArguments(block.input);
+        // A call_tool call is shown with the server of the tool it runs.
+        const routedName = searchMode && block.name === 'call_tool' ? String(args.name) : block.name;
         emit({
           type: 'tool_call',
           id: block.id,
           name: block.name,
-          server: deps.registry.resolve(block.name)?.upstreamName ?? null,
+          server: deps.registry.resolve(routedName)?.upstreamName ?? null,
           input: block.input,
         });
-        const result = await callTool(
-          deps,
-          { member, via: 'chat' },
-          { name: block.name, arguments: toolArguments(block.input), signal },
-        );
+        const call = { name: block.name, arguments: args, signal };
+        const caller = { member, via: 'chat' as const };
+        const result = searchMode
+          ? await runMetaTool(deps, caller, call)
+          : await callTool(deps, caller, call);
         const text = toolResultText(result);
         emit({
           type: 'tool_result',

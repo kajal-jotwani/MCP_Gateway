@@ -341,6 +341,23 @@ Options considered: per-member allow lists, per-role rules, or scopes on API key
 
 Not done: per-member rules, and restrictions on tool arguments (for example "members may only set orders to completed").
 
+### Many tools: search, then call
+
+Ten servers can mean hundreds of tools. Every tool definition sits in the model's context on every request, and choosing among hundreds of similar names gets less reliable.
+
+Options considered:
+
+- Claude API's server-side tool search (`tool_search_tool_bm25_20251119` with `defer_loading` on the other tools). It only helps the chat agent, not Claude Code, Cursor or Inspector connected to `/mcp`, and the gateway would still send every definition on every request.
+- Grouping tools per server and letting the client pick servers. Clients have no standard way to do that.
+- **Two meta-tools served by the gateway itself.** They work for every MCP client and for the chat agent, and keep one implementation.
+
+**Decision:** `/mcp/search` is the same endpoint (same API keys, same stateless handler) in search mode. Its `tools/list` returns only:
+
+- `search_tools {query, limit?}`: ranks the caller's tools against the keywords. A term found in the tool name scores 3, in the server's name or slug 2, in the title or description 1; plurals and prefixes match (`order` finds `list_orders`, `orders` finds `get_order`). Returns up to `limit` (default 8, at most 20) tools with name, server, description and input schema, as text and as structured content. The search is pure and unit-tested; it runs over `toolsFor`, so admin-only tools are never found by members.
+- `call_tool {name, arguments}`: runs the named tool through the single call path, so routing, permissions, timeouts and the audit entry are those of the real tool (`tool = list_orders`, not `call_tool`). Searching is not audited, as listing is not.
+
+`/mcp` is unchanged, so D4 and every existing client keep the full list. The chat agent uses the same two tools when the member can call more than 40 tools (`CHAT_TOOL_LIMIT`); below that it gets the full list as before. The UI shows `call_tool` with the server of the tool it ran. Keyword ranking was chosen over embeddings because tool names and descriptions are short and the gateway would need no model or index; the cost is that a query must share a word with the tool.
+
 ### Observability
 
 Three views, each for a different reader:
@@ -468,6 +485,7 @@ Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and ever
 | C1, C2, C3 | Claude Messages API loop in the gateway using the same path, tool calls streamed to the UI, key in a Secret |
 | SSRF guard | Address checks in the upstream clients' DNS lookup on every connection and on save; internal host list from the chart |
 | Credentials at rest | AES-256-GCM in the gateway, key `UPSTREAM_CREDENTIAL_KEY` from `gateway-credentials`; clear values encrypted on start |
+| Many tools | `/mcp/search` with `search_tools` and `call_tool`; chat switches above 40 tools |
 | Tool permissions | `upstreams.admin_only` and `admin_only_tools`; `mayCallTool` in listing (`toolsFor`) and in the single call path |
 | Observability | Failure reasons from the error cause chain; per-server stats from `audit_entries`; Prometheus `/metrics` on port 9464 |
 | Multi-store bonus | `stores` table and Stores page; provisioner running Helm per namespace `store-<slug>`; RBAC bound per store namespace plus an admission policy; quota, LimitRange, per-member limit and timeout; woo-mcp egress policy; store tools always `<slug>__<tool>` |
