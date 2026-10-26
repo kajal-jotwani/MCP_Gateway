@@ -1,5 +1,5 @@
-# Every pod in the namespace refuses incoming traffic unless a policy below allows it. Egress is
-# not restricted: the gateway calls upstreams that admins add anywhere, and the Claude API.
+# Every pod in the namespace refuses incoming and outgoing traffic unless a policy below allows it.
+# PostgreSQL and notes-mcp get no egress rule at all: they only answer connections.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -9,6 +9,80 @@ metadata:
 spec:
   podSelector: {}
   policyTypes: ["Ingress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  labels:
+    {{- include "gateway.labels" (dict "root" $ "name" "default-deny-egress") | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+---
+# The gateway calls upstreams that admins add anywhere, in the cluster or outside it, and the Claude
+# API; the provisioner calls the Kubernetes API. Both reach anything but link-local addresses, so
+# not a cloud metadata endpoint. The gateway's own network guard narrows what upstreams may use.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-egress
+  labels:
+    {{- include "gateway.labels" (dict "root" $ "name" "gateway-egress") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: ["gateway", "provisioner"]
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector: {}
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16
+---
+# gzip-file-as-resource fetches from raw.githubusercontent.com (GZIP_ALLOWED_DOMAINS), so everything
+# may use DNS and HTTPS to public addresses, and nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: everything-egress
+  labels:
+    {{- include "gateway.labels" (dict "root" $ "name" "everything") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gateway.selectorLabels" (dict "root" $ "name" "everything") | nindent 6 }}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+              except:
+                - 10.0.0.0/8
+                - 172.16.0.0/12
+                - 192.168.0.0/16
+                - 100.64.0.0/10
+                - 169.254.0.0/16
+      ports:
+        - port: 443
 ---
 # Browsers and MCP clients reach the gateway only through the Ingress controller.
 apiVersion: networking.k8s.io/v1

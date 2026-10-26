@@ -272,7 +272,15 @@ Each chart has a default-deny ingress policy for its namespace, then allows (`ch
 - `gateway`: from the Ingress controller's namespace.
 - `notes-mcp`, `server-everything`, `postgres`: from the gateway only.
 
-Egress is not restricted: the gateway calls upstreams that admins add anywhere and the Claude API, and WordPress downloads plugins.
+Each chart also has a default-deny egress policy, then allows:
+
+- `gateway` and the provisioner: any pod in the cluster and any address except link-local `169.254.0.0/16`, because upstreams can live anywhere and the provisioner needs the Kubernetes API. The application-level network guard (Server-side request forgery guard) narrows what an upstream URL may use; the policy is the backstop for the metadata endpoint.
+- `server-everything`: DNS and TCP 443 to public addresses, for `gzip-file-as-resource`.
+- `woo-mcp`: its own WordPress and DNS (added with multi-store).
+- WordPress and the setup Job: their own MariaDB, DNS, and TCP 80 and 443 to public addresses, to download WordPress and WooCommerce. They cannot reach another store, the gateway's namespace or a metadata endpoint.
+- PostgreSQL, notes-mcp and MariaDB: nothing. They only answer connections, and replies to an allowed connection are not egress.
+
+Private ranges are excluded from the "public" rules (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`), which also keeps those pods off the node network and the cluster's pod and Service ranges.
 
 W4 is demonstrated in two ways: there is no Ingress or NodePort for woo-mcp, and a test pod in another namespace (or a pod in the gateway's namespace that is not the gateway) cannot connect to woo-mcp, while the gateway's calls succeed (README, "Check that woo-mcp is internal"). **Verified (stage 7)** on k3s v1.36.5: before the policies a pod in `default` reached every internal Service; after them it, a pod in `default` labeled `app.kubernetes.io/name=gateway`, and a non-gateway pod in `gateway` cannot connect to woo-mcp, WordPress, MariaDB, PostgreSQL, notes-mcp or server-everything (kube-router rejects the connection). The storefront, wp-admin, the setup Job and all three upstreams kept working.
 

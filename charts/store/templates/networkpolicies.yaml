@@ -1,5 +1,5 @@
-# Every pod in the namespace refuses incoming traffic unless a policy below allows it. Only woo-mcp's
-# egress is restricted: WordPress and the setup Job download plugins.
+# Every pod in the namespace refuses incoming and outgoing traffic unless a policy below allows it.
+# MariaDB gets no egress rule at all: it only answers connections.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -9,6 +9,66 @@ metadata:
 spec:
   podSelector: {}
   policyTypes: ["Ingress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  labels:
+    {{- include "store.labels" (dict "root" $ "name" "default-deny-egress") | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+---
+# WordPress and the setup Job use this store's MariaDB and download WordPress and WooCommerce from
+# the internet. Private and link-local addresses are left out, so they cannot reach other stores,
+# the gateway's namespace or a cloud metadata endpoint.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: wordpress-egress
+  labels:
+    {{- include "store.labels" (dict "root" $ "name" "wordpress") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: ["wordpress", "store-setup"]
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "store.selectorLabels" (dict "root" $ "name" "mariadb") | nindent 14 }}
+      ports:
+        - port: 3306
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+              except:
+                - 10.0.0.0/8
+                - 172.16.0.0/12
+                - 192.168.0.0/16
+                - 100.64.0.0/10
+                - 169.254.0.0/16
+      ports:
+        - port: 80
+        - port: 443
 ---
 # Only the gateway's pods call woo-mcp. Other pods in the gateway's namespace, and every other
 # namespace, are refused.
