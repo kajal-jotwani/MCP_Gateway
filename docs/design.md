@@ -456,6 +456,33 @@ Isolation: the store chart's NetworkPolicies already admit MariaDB connections o
 
 **Verified (multi-store, Kajal's Mac, k3d with k3s 1.36.5, real setup Job and Claude API):** after `helm upgrade` of both releases to gateway image 0.2.0, Delhi and Pune were created at the same time and were both Ready about 45 seconds later, each with WooCommerce installed by its setup Job, its own volumes and Ingress host. The gateway listed `delhi__*`, `pune__*` and `woocommerce__*`. The README isolation check from Delhi's woo-mcp reached Delhi's WordPress and was refused by Pune's WordPress and MariaDB. Asked to compare today's orders in both stores, the chat agent called `delhi__list_orders` and `pune__list_orders`, and both calls were audited under the member with `via = chat`. Deleting Pune removed its upstream at once, and its namespace and both volumes within about 15 seconds.
 
+### Hosted MCP servers
+
+Admins can add a server by container image instead of by URL. The platform runs it in its own namespace, registers it as an upstream once it is up, and removes everything when it is deleted.
+
+Options considered:
+
+- Deploy the image into the `gateway` namespace with the gateway chart, as notes-mcp and everything are. One fewer moving part, but every new server would be a `helm upgrade` of the gateway by an operator, and a hosted image would share a namespace, and its NetworkPolicies, with PostgreSQL.
+- A namespace per server, created by the gateway itself. The gateway would need Kubernetes rights.
+- **Decision:** reuse the store provisioner. A hosted server is a row in a `hosted_servers` table, like a store; the provisioner installs a small chart, `charts/hosted-mcp`, in the namespace `mcp-<slug>`, with the same RBAC, admission policy, recovery and timeout as stores. The provisioner code has one deployment loop and two kinds (`storeKind` and `hostedServerKind` in `gateway/src/provisioner.ts`) that say which table, namespace, Secret, chart and values each uses.
+
+Adding a server (`POST /api/hosted-servers`, admins only) takes a name, an optional slug, an image, a port, a path and environment variables:
+
+- The image must be pinned: a tag other than `latest`, or a `@sha256:` digest. A rollback then returns to the image that ran, and an image reference cannot carry extra arguments.
+- Variable names must be valid shell names. `HOME`, `PATH`, `LD_PRELOAD` and `NODE_OPTIONS` are refused, because the chart sets `HOME` and the others would change how the container starts.
+- The environment is stored encrypted with the same AES-256-GCM key as upstream credentials (`UPSTREAM_CREDENTIAL_KEY`). The API returns only the variable names. The provisioner decrypts it to create the Secret `server-env` in the server's namespace, which the Deployment reads with `envFrom`.
+
+The `hosted-mcp` chart installs:
+
+- A Deployment `server` with one replica, running as uid 65532 whatever the image says, with a read-only root filesystem, no capabilities, no service account token, and a 64 MiB `/tmp`. Requests 50m CPU and 64 MiB, limits 500m and 256 MiB. Startup, readiness and liveness probes connect to the port: a generic image has no health route to call.
+- A ClusterIP Service `server`, and no Ingress.
+- NetworkPolicies: default deny both ways; ingress only from pods labelled `app.kubernetes.io/name: gateway` in the gateway's namespace; egress only to DNS and to public addresses on ports 80 and 443, for the APIs an MCP server usually wraps.
+- A ResourceQuota (2 pods, 1 CPU and 512 MiB in limits, no claims, LoadBalancers or NodePorts).
+
+When Helm succeeds, one transaction marks the server `ready` and inserts its upstream at `http://server.mcp-<slug>.svc.cluster.local:<port><path>` with `upstreams.hosted_server_id` set, and announces the change, so every gateway replica connects it at once. `server.mcp-*.svc.cluster.local` is on the network guard's internal host list. Deleting a hosted server removes its upstream in the same request and the provisioner then deletes the namespace, as for a store. A hosted server's upstream can be enabled, disabled and limited to admins on the Servers page, but not edited or removed there (409).
+
+Not done: changing a hosted server's image or environment after it is created (delete it and add it again), private registries (an image pull Secret), and a health check deeper than the TCP port.
+
 ## Request flows
 
 External client `tools/call`:
@@ -476,9 +503,10 @@ members        id, email (unique), name, role (admin|member), password_hash, act
 sessions       id_hash, member_id, expires_at
 invites        id, token_hash (unique), email, role, created_by, expires_at
 api_keys       id, member_id, key_hash (unique), display_prefix, name, created_by, created_at, revoked_at, last_used_at
-upstreams      id, slug (unique), name, url, auth_type (none|bearer|header), auth_header_name, auth_secret, enabled, admin_only, store_id (nullable, unique, deleted with its store), created_at, updated_at
+upstreams      id, slug (unique), name, url, auth_type (none|bearer|header), auth_header_name, auth_secret, enabled, admin_only, store_id (nullable, unique, deleted with its store), hosted_server_id (nullable, unique, deleted with its hosted server), created_at, updated_at
 admin_only_tools  upstream_id (deleted with its upstream), tool (the upstream's tool name)
 stores         id, slug (unique, DNS label), name, url, owner_id, status (provisioning|ready|failed|deleting), reason, attempt, attempt_started_at, created_at, updated_at
+hosted_servers id, slug (unique, DNS label), name, image, port, path, env (encrypted JSON), status (provisioning|ready|failed|deleting), reason, attempt, attempt_started_at, created_by, created_at, updated_at
 bootstrap      action, done_at
 tool_call_windows  member_id, window_start (a minute), calls
 oauth_clients  id, name, redirect_uris, created_at
@@ -498,6 +526,7 @@ The WooCommerce upstream is inserted on the gateway's first start from chart val
 | `store.<domain>`: WordPress | woo-mcp, MariaDB |
 | `app.<domain>`: gateway (dashboard, `/api`, `/mcp`) | PostgreSQL, notes-mcp, server-everything, the store provisioner (no Service) |
 | `store-<slug>.<domain>`: WordPress of each provisioned store | its woo-mcp and MariaDB |
+| | `server` in `mcp-<slug>`, one per hosted MCP server |
 
 Every long-running workload has requests and limits and readiness and liveness probes that check something real (the setup Job has requests and limits instead of probes, and is bounded by `backoffLimit: 2` and `activeDeadlineSeconds: 900`):
 
@@ -510,6 +539,7 @@ Every long-running workload has requests and limits and readiness and liveness p
 | PostgreSQL | `pg_isready` | `pg_isready` |
 | notes-mcp | `/healthz` | same |
 | server-everything | TCP 3001 (it has no health route, and `GET /mcp` without a session is a 400) | same |
+| hosted MCP server | TCP on its port (startup, readiness and liveness) | same |
 | store provisioner | `/healthz`: a pass over the stores table finished in the last 60 s (database reachable, loop not stuck) | same |
 
 Every long-running container runs as a non-root user with all capabilities dropped and privilege escalation off (**Verified (stage 7)** from `/proc/1/status` in each pod: uid 33 WordPress, 999 MariaDB, 70 PostgreSQL, 1000 for the Node images, no effective capabilities). WordPress runs Apache as `www-data` on port 80; the pod sets the namespaced sysctl `net.ipv4.ip_unprivileged_port_start=0` so no root or `NET_BIND_SERVICE` is needed. The one exception is a short init container in the WordPress pod and the setup Job that runs as root with only `CHOWN`, to hand the freshly created volume roots to `www-data`: `local-path` volumes ignore `fsGroup`.
@@ -546,6 +576,7 @@ Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and ever
 | OAuth | Gateway as authorization server: RFC 9728 and 8414 discovery, open registration of public clients, PKCE S256 codes approved in the dashboard, hashed revocable grants audited as `oauth:<id>` |
 | Scaling | Two replicas; PostgreSQL `LISTEN/NOTIFY` on `gateway_changes` for admin and provisioner changes; stateless MCP endpoint |
 | Rate limit | `tool_call_windows` counter per member per minute, checked in the single call path |
+| Hosted servers | `hosted_servers` table and the Servers page; provisioner kind installing `charts/hosted-mcp` in `mcp-<slug>` with an encrypted environment written to a Secret, fixed limits, a quota and NetworkPolicies admitting only the gateway |
 | Multi-store bonus | `stores` table and Stores page; provisioner running Helm per namespace `store-<slug>`; RBAC bound per store namespace plus an admission policy; quota, LimitRange, per-member limit and timeout; woo-mcp egress policy; store tools always `<slug>__<tool>` |
 
 ## Production changes

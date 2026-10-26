@@ -20,6 +20,8 @@ export interface Upstream {
   enabled: boolean;
   /** The provisioned store this upstream belongs to. Such an upstream is changed through its store. */
   storeId: string | null;
+  /** The hosted server this upstream runs. Such an upstream is removed by deleting the hosted server. */
+  hostedServerId: string | null;
 }
 
 interface UpstreamRow extends Upstream {
@@ -41,7 +43,7 @@ export interface UpstreamInput {
 }
 
 const PUBLIC_COLUMNS = `id, slug, name, url, auth_type AS "authType", auth_header_name AS "authHeaderName", enabled,
-  store_id AS "storeId"`;
+  store_id AS "storeId", hosted_server_id AS "hostedServerId"`;
 const UPSTREAM_COLUMNS = `${PUBLIC_COLUMNS}, auth_secret AS "authSecret"`;
 
 function toConfig(row: UpstreamRow, cipher: CredentialCipher): UpstreamConfig {
@@ -142,8 +144,8 @@ function storedAuthAfter(
 }
 
 /**
- * Inserts an upstream. Returns 'slug_taken' when another upstream or a store has the slug, and
- * 'secret_required' when the credential type needs a secret and none was given.
+ * Inserts an upstream. Returns 'slug_taken' when another upstream, a store or a hosted server has
+ * the slug, and 'secret_required' when the credential type needs a secret and none was given.
  */
 export async function createUpstream(
   db: Queryable,
@@ -161,6 +163,7 @@ export async function createUpstream(
     `INSERT INTO upstreams (slug, name, url, auth_type, auth_header_name, auth_secret, enabled)
      SELECT $1::text, $2::text, $3::text, $4::text, $5::text, $6::text, $7::boolean
      WHERE NOT EXISTS (SELECT 1 FROM stores WHERE slug = $1)
+       AND NOT EXISTS (SELECT 1 FROM hosted_servers WHERE slug = $1)
      ON CONFLICT (slug) DO NOTHING RETURNING ${PUBLIC_COLUMNS}`,
     [input.slug, input.name, input.url, auth.authType, auth.authHeaderName, auth.authSecret, input.enabled],
   );
@@ -168,23 +171,25 @@ export async function createUpstream(
 }
 
 /**
- * Applies an admin's edit. Returns undefined for an unknown id, 'slug_taken' when another upstream
- * or a store has the new slug, 'secret_required' as described for storedAuthAfter, and
- * 'store_managed' for any change but enabling or disabling a store's upstream.
+ * Applies an admin's edit. Returns undefined for an unknown id, 'slug_taken' when another upstream,
+ * a store or a hosted server has the new slug, 'secret_required' as described for storedAuthAfter,
+ * and 'store_managed' or 'hosted_managed' for any change but enabling or disabling a store's or
+ * hosted server's upstream.
  */
 export async function updateUpstream(
   db: Database,
   cipher: CredentialCipher,
   id: string,
   changes: Partial<UpstreamInput>,
-): Promise<Upstream | undefined | 'slug_taken' | 'secret_required' | 'store_managed'> {
+): Promise<Upstream | undefined | 'slug_taken' | 'secret_required' | ManagedUpstream> {
   return db.transaction(async (tx) => {
     const [current] = await tx.query<UpstreamRow>(
       `SELECT ${UPSTREAM_COLUMNS} FROM upstreams WHERE id = $1 FOR UPDATE`,
       [id],
     );
     if (!current) return undefined;
-    if (current.storeId && Object.keys(changes).some((field) => field !== 'enabled')) return 'store_managed';
+    const managed = managedBy(current);
+    if (managed && Object.keys(changes).some((field) => field !== 'enabled')) return managed;
     const url = changes.url ?? current.url;
     const auth = storedAuthAfter(current, changes.auth, url !== current.url, cipher);
     if (auth === 'secret_required') return auth;
@@ -193,6 +198,7 @@ export async function updateUpstream(
          auth_secret = $7, enabled = $8, updated_at = now()
        WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM upstreams WHERE slug = $2 AND id <> $1)
          AND NOT EXISTS (SELECT 1 FROM stores WHERE slug = $2 AND id IS DISTINCT FROM $9)
+         AND NOT EXISTS (SELECT 1 FROM hosted_servers WHERE slug = $2 AND id IS DISTINCT FROM $10)
        RETURNING ${PUBLIC_COLUMNS}`,
       [
         id,
@@ -204,23 +210,32 @@ export async function updateUpstream(
         auth.authSecret,
         changes.enabled ?? current.enabled,
         current.storeId,
+        current.hostedServerId,
       ],
     );
     return upstream ?? 'slug_taken';
   });
 }
 
+/** An upstream the platform created, which is changed through its store or hosted server. */
+export type ManagedUpstream = 'store_managed' | 'hosted_managed';
+
+function managedBy(upstream: Upstream): ManagedUpstream | undefined {
+  if (upstream.storeId) return 'store_managed';
+  if (upstream.hostedServerId) return 'hosted_managed';
+  return undefined;
+}
+
 /**
- * Removes an upstream and returns whether it existed. A store's upstream is not removed and gives
- * 'store_managed': deleting the store removes it.
+ * Removes an upstream and returns whether it existed. A store's or hosted server's upstream is not
+ * removed and gives why: deleting the store or the hosted server removes it.
  */
-export async function deleteUpstream(db: Queryable, id: string): Promise<boolean | 'store_managed'> {
-  if (
-    (await db.query('DELETE FROM upstreams WHERE id = $1 AND store_id IS NULL RETURNING id', [id])).length
-  ) {
-    return true;
-  }
-  return (await db.query('SELECT 1 FROM upstreams WHERE id = $1', [id])).length > 0 ? 'store_managed' : false;
+export async function deleteUpstream(db: Queryable, id: string): Promise<boolean | ManagedUpstream> {
+  const [upstream] = await db.query<Upstream>(`SELECT ${PUBLIC_COLUMNS} FROM upstreams WHERE id = $1`, [id]);
+  if (!upstream) return false;
+  const managed = managedBy(upstream);
+  if (managed) return managed;
+  return (await db.query('DELETE FROM upstreams WHERE id = $1 RETURNING id', [id])).length > 0;
 }
 
 /** The admin-only servers and tools. Read on every listing and call, so a change applies at once. */

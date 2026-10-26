@@ -82,6 +82,8 @@ describe('loadProvisionerConfig', () => {
     STORE_ROLE: 'gateway-store',
     STORE_CHART_PATH: '/app/charts/store',
     STORE_VALUES_FILE: '/config/store-values.yaml',
+    HOSTED_SERVER_CHART_PATH: '/app/charts/hosted-mcp',
+    UPSTREAM_CREDENTIAL_KEY: Buffer.alloc(32, 7).toString('base64'),
     PROVISION_TIMEOUT_MINUTES: '15',
   };
 
@@ -89,7 +91,8 @@ describe('loadProvisionerConfig', () => {
     expect(loadProvisionerConfig(provisionerEnv)).toMatchObject({
       port: 8081,
       gatewayNamespace: 'gateway',
-      valuesFiles: ['/config/store-values.yaml'],
+      storeChart: { release: 'store', path: '/app/charts/store', valuesFiles: ['/config/store-values.yaml'] },
+      hostedServerChart: { release: 'server', path: '/app/charts/hosted-mcp', valuesFiles: [] },
       timeoutMs: 15 * 60_000,
     });
   });

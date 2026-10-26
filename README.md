@@ -276,6 +276,35 @@ for (const host of ["wordpress.store-delhi", "wordpress.store-pune", "mariadb-0.
 }'
 ```
 
+### Host an MCP server from an image
+
+Admins can have the platform run a server instead of registering a URL. At the bottom of the **Servers** page, click **Host a server** and enter a name, a pinned image, the port and MCP path it serves, and any environment variables as `NAME=value` lines. For example, a second copy of the reference server, from the image already loaded into the cluster:
+
+- Name `Demo tools`, image `urumi/everything:2.0.0`, port `3001`, path `/mcp`
+- Environment `GZIP_ALLOWED_DOMAINS=raw.githubusercontent.com`
+
+The server shows as Deploying. The provisioner creates the namespace `mcp-demo-tools` with a Secret `server-env` holding the environment, and installs `charts/hosted-mcp`: one Deployment running as a non-root user with a read-only filesystem and fixed limits, a ClusterIP Service, a ResourceQuota, and NetworkPolicies that admit only the gateway and let the server reach only DNS and public HTTP(S). Once the pod is ready the server shows as Running and appears above as an upstream; its tools collide with the bundled everything server's, so both sets become `everything__...` and `demo-tools__...`. The environment values are never shown again, only their names.
+
+```sh
+kubectl -n mcp-demo-tools get deploy,svc,networkpolicy,resourcequota,secret
+```
+
+From another pod the server refuses connections, and from the server PostgreSQL and the store are out of reach:
+
+```sh
+kubectl run probe --rm -it --restart=Never --image=postgres:18.6-alpine3.24 -- \
+  wget -T 5 -qO- http://server.mcp-demo-tools.svc.cluster.local:3001/mcp
+kubectl -n mcp-demo-tools exec deploy/server -- node -e '
+for (const [host, port] of [["postgres.gateway", 5432], ["wordpress.store", 80]]) {
+  const s = require("net").connect({ host: host + ".svc.cluster.local", port, timeout: 3000 });
+  s.on("connect", () => { console.log(host, "open"); s.destroy(); });
+  s.on("error", (e) => console.log(host, e.code));
+  s.on("timeout", () => { console.log(host, "timeout"); s.destroy(); });
+}'
+```
+
+**Delete** removes its tools from every client at once, then the provisioner deletes the namespace. A server that is not ready within `stores.provisionTimeoutMinutes` shows as Failed with the reason, for example an image the cluster cannot pull, and **Retry** starts again. To change the image or the environment, delete the server and host it again. Images must be pinned to a version or a digest; `latest` is refused.
+
 ### Check that woo-mcp is internal
 
 There is no Ingress for woo-mcp, and its NetworkPolicy admits only the gateway's pods. From any other pod the connection fails, for example from a throwaway pod in the `default` namespace:

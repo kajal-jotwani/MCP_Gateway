@@ -1,0 +1,18 @@
+# Set by the provisioner for each hosted server.
+image: ''
+# The port the server listens on for Streamable HTTP.
+port: 3000
+# The namespace whose gateway pods may call the server.
+gatewayNamespace: gateway
+# The Secret the provisioner creates with the server's environment variables, one key per variable.
+envSecret: server-env
+
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits: { cpu: 500m, memory: 256Mi }
+
+# The most the namespace may hold, so a rollout's surge pod fits but nothing else does.
+quota:
+  requests: { cpu: 200m, memory: 256Mi }
+  limits: { cpu: '1', memory: 512Mi }
+  pods: 2

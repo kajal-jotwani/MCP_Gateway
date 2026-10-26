@@ -1,30 +1,39 @@
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 
-/** What the provisioner needs to know about a store namespace. */
+/** What the provisioner needs to know about a namespace of a store or hosted server. */
 export interface NamespaceState {
-  /** The store id label the provisioner put on the namespace; undefined on a namespace it did not create. */
-  storeId?: string;
+  /** The owner id label the provisioner put on the namespace; undefined on a namespace it did not create. */
+  ownerId?: string;
   terminating: boolean;
 }
 
-/** Status of the Helm release in a store namespace, such as 'deployed' or 'pending-install'. */
+/** Status of a Helm release, such as 'deployed' or 'pending-install'. */
 export type ReleaseStatus = string;
+
+/** A chart the provisioner installs, one release per namespace. */
+export interface HelmChart {
+  release: string;
+  path: string;
+  /** Values files applied before the per-release values, such as the image overrides of values-local.yaml. */
+  valuesFiles: string[];
+}
 
 /** The Kubernetes and Helm operations the provisioner uses, so its logic can be tested without a cluster. */
 export interface StoreCluster {
   getNamespace(name: string): Promise<NamespaceState | undefined>;
-  createNamespace(name: string, storeId: string): Promise<void>;
+  createNamespace(name: string, ownerId: string): Promise<void>;
   /** Grants the provisioner the store role inside the namespace. Safe to repeat. */
   grantStoreRole(namespace: string): Promise<void>;
   deleteNamespace(name: string): Promise<void>;
   /** Creates the Secret unless one of that name exists, which is kept as it is. */
   createSecretIfAbsent(namespace: string, name: string, data: Record<string, string>): Promise<void>;
-  releaseStatus(namespace: string): Promise<ReleaseStatus | undefined>;
-  uninstallRelease(namespace: string, signal: AbortSignal): Promise<void>;
-  /** Runs helm upgrade --install and waits for the workloads and the setup Job. Throws HelmError. */
+  releaseStatus(namespace: string, release: string): Promise<ReleaseStatus | undefined>;
+  uninstallRelease(namespace: string, release: string, signal: AbortSignal): Promise<void>;
+  /** Runs helm upgrade --install and waits for the workloads and any hook Jobs. Throws HelmError. */
   installRelease(
     namespace: string,
+    chart: HelmChart,
     values: Record<string, unknown>,
     timeoutMs: number,
     signal: AbortSignal,
@@ -37,9 +46,9 @@ export class HelmError extends Error {}
 /** Labels that mark a namespace as the provisioner's. The admission policy in the gateway chart checks the first. */
 export const MANAGED_BY_LABEL = 'app.kubernetes.io/managed-by';
 export const MANAGED_BY_VALUE = 'urumi-provisioner';
-export const STORE_ID_LABEL = 'urumi.dev/store-id';
-
-const RELEASE_NAME = 'store';
+// Named when stores were the only kind; it holds the id of the store or hosted server that owns the
+// namespace. Kept, so namespaces created before hosted servers still match.
+export const OWNER_ID_LABEL = 'urumi.dev/store-id';
 const SERVICE_ACCOUNT_DIR = '/var/run/secrets/kubernetes.io/serviceaccount';
 const API_TIMEOUT_MS = 10_000;
 const MAX_HELM_OUTPUT_BYTES = 1_000_000;
@@ -49,9 +58,6 @@ const MAX_HELM_OUTPUT_BYTES = 1_000_000;
  * The API server's CA must be trusted through NODE_EXTRA_CA_CERTS. Helm finds the same account itself.
  */
 export function createInClusterStoreCluster(options: {
-  chartPath: string;
-  /** Values files applied before the per-store values, such as the image overrides of values-local.yaml. */
-  valuesFiles: string[];
   serviceAccount: { name: string; namespace: string };
   storeRole: string;
 }): StoreCluster {
@@ -109,16 +115,16 @@ export function createInClusterStoreCluster(options: {
       };
       const labels = namespace.metadata.labels ?? {};
       return {
-        storeId: labels[MANAGED_BY_LABEL] === MANAGED_BY_VALUE ? labels[STORE_ID_LABEL] : undefined,
+        ownerId: labels[MANAGED_BY_LABEL] === MANAGED_BY_VALUE ? labels[OWNER_ID_LABEL] : undefined,
         terminating: namespace.status?.phase === 'Terminating',
       };
     },
 
-    async createNamespace(name, storeId) {
+    async createNamespace(name, ownerId) {
       await request('POST', '/api/v1/namespaces', {
         apiVersion: 'v1',
         kind: 'Namespace',
-        metadata: { name, labels: { [MANAGED_BY_LABEL]: MANAGED_BY_VALUE, [STORE_ID_LABEL]: storeId } },
+        metadata: { name, labels: { [MANAGED_BY_LABEL]: MANAGED_BY_VALUE, [OWNER_ID_LABEL]: ownerId } },
       });
     },
 
@@ -151,30 +157,30 @@ export function createInClusterStoreCluster(options: {
       );
     },
 
-    async releaseStatus(namespace) {
+    async releaseStatus(namespace, release) {
       const releases = JSON.parse(
         await helm(
           ['list', '--namespace', namespace, '--output', 'json'],
           AbortSignal.timeout(API_TIMEOUT_MS),
         ),
       ) as { name: string; status: string }[];
-      return releases.find((release) => release.name === RELEASE_NAME)?.status;
+      return releases.find((candidate) => candidate.name === release)?.status;
     },
 
-    async uninstallRelease(namespace, signal) {
-      await helm(['uninstall', RELEASE_NAME, '--namespace', namespace, '--wait'], signal);
+    async uninstallRelease(namespace, release, signal) {
+      await helm(['uninstall', release, '--namespace', namespace, '--wait'], signal);
     },
 
-    async installRelease(namespace, values, timeoutMs, signal) {
+    async installRelease(namespace, chart, values, timeoutMs, signal) {
       // Values go through stdin, so a store name needs no escaping for --set.
       const args = [
         'upgrade',
         '--install',
-        RELEASE_NAME,
-        options.chartPath,
+        chart.release,
+        chart.path,
         '--namespace',
         namespace,
-        ...options.valuesFiles.flatMap((file) => ['--values', file]),
+        ...chart.valuesFiles.flatMap((file) => ['--values', file]),
         '--values',
         '-',
         '--wait=watcher',

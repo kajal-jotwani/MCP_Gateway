@@ -50,8 +50,8 @@ ingress:
 upstreamNetwork:
   # Host names an upstream URL may use although they resolve to a private or cluster-internal
   # address, such as my-mcp.tools.svc.cluster.local. A * matches part of one label. The seeded store,
-  # notes-mcp, everything and provisioned stores are always allowed. Loopback, link-local and cloud
-  # metadata addresses are refused for every host.
+  # notes-mcp, everything, provisioned stores and hosted servers are always allowed. Loopback,
+  # link-local and cloud metadata addresses are refused for every host.
   internalHosts: []
 
 metrics:

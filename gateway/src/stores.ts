@@ -64,7 +64,7 @@ export type CreateStoreRefusal = 'limit_reached' | 'slug_taken' | 'being_deleted
 /**
  * Records a store for the provisioner to create. Repeating the request for a store the owner already
  * has returns that store with `created: false`, so a retried request does not start a second one.
- * Refuses when the slug belongs to another member's store or an upstream, while the owner's store of
+ * Refuses when the slug belongs to another member's store, an upstream or a hosted server, while the owner's store of
  * that slug is still being deleted, and when the owner already has `maxPerMember` stores.
  */
 export async function createStore(
@@ -81,7 +81,11 @@ export async function createStore(
       if (existing.ownerId !== input.ownerId) return 'slug_taken';
       return existing.status === 'deleting' ? 'being_deleted' : { store: existing, created: false };
     }
-    if ((await tx.query('SELECT 1 FROM upstreams WHERE slug = $1', [input.slug])).length) return 'slug_taken';
+    const taken = await tx.query(
+      'SELECT 1 FROM upstreams WHERE slug = $1 UNION ALL SELECT 1 FROM hosted_servers WHERE slug = $1',
+      [input.slug],
+    );
+    if (taken.length) return 'slug_taken';
     const [{ count }] = (await tx.query<{ count: number }>(
       'SELECT count(*)::int AS count FROM stores WHERE owner_id = $1',
       [input.ownerId],

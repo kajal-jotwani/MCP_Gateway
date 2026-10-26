@@ -1,7 +1,7 @@
 {{- $component := dict "root" $ "name" "provisioner" }}
 {{- $serviceAccount := printf "%s-provisioner" .Release.Name }}
 # The only workload with Kubernetes API rights. The gateway, which faces the internet, has none: it
-# writes store requests to PostgreSQL, and the provisioner carries them out.
+# writes store and hosted server requests to PostgreSQL, and the provisioner carries them out.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -45,8 +45,8 @@ subjects:
     name: {{ $serviceAccount }}
     namespace: {{ .Release.Namespace }}
 ---
-# What helm needs to install the store chart. The provisioner binds it in each store namespace it
-# creates, with a RoleBinding there, so these rights hold in store namespaces only.
+# What helm needs to install the store chart and the hosted server chart. The provisioner binds it in
+# each namespace it creates, with a RoleBinding there, so these rights hold in those namespaces only.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -174,6 +174,10 @@ spec:
               value: /app/charts/store
             - name: STORE_VALUES_FILE
               value: /config/store-values.yaml
+            - name: HOSTED_SERVER_CHART_PATH
+              value: /app/charts/hosted-mcp
+            # Decrypts a hosted server's environment to write it into the server's own Secret.
+            {{- include "gateway.secretEnv" (list .Values.secrets.gateway "UPSTREAM_CREDENTIAL_KEY" "UPSTREAM_CREDENTIAL_KEY") | nindent 12 }}
             - name: PROVISION_TIMEOUT_MINUTES
               value: {{ .Values.stores.provisionTimeoutMinutes | quote }}
             # Node trusts the API server's certificate through the service account's CA.

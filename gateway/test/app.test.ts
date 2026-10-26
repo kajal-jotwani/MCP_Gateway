@@ -28,6 +28,12 @@ import { UpstreamRegistry } from '../src/registry.js';
 import { changeMember, createMember, ensureFirstAdmin, hashPassword, verifyPassword } from '../src/team.js';
 import type { Member, Role } from '../src/team.js';
 import { listStoreTasks, markStoreFailed, markStoreReady } from '../src/stores.js';
+import {
+  listHostedServerTasks,
+  markHostedServerFailed,
+  markHostedServerReady,
+} from '../src/hostedServers.js';
+import type { HostedServer, HostedServerTask } from '../src/hostedServers.js';
 import type { StoreTask } from '../src/stores.js';
 import { startMetricsServer } from '../src/metrics.js';
 import { createCredentialCipher } from '../src/credentialCipher.js';
@@ -690,6 +696,7 @@ describe('upstream servers', () => {
       'checkedAt',
       'enabled',
       'error',
+      'hostedServerId',
       'id',
       'name',
       'slug',
@@ -1102,6 +1109,131 @@ describe('stores', () => {
 
     const admin = await adminBrowser(gateway);
     expect((await admin.request('DELETE', `/stores/${storeId}`)).status).toBe(202);
+  });
+});
+
+describe('hosted servers', () => {
+  let isolated: Database;
+  beforeEach(async () => {
+    isolated = await isolatedDatabase();
+  });
+
+  const everything = { name: 'Everything', image: 'urumi/everything:2.0.0', port: 3001, path: '/mcp' };
+
+  it('records a server for the provisioner without ever returning its environment values', async () => {
+    const gateway = await startGateway(isolated);
+    const admin = await adminBrowser(gateway);
+    const value = randomUUID();
+
+    const created = await admin.request('POST', '/hosted-servers', {
+      ...everything,
+      env: { API_TOKEN: value },
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.server).toMatchObject({
+      slug: 'everything',
+      status: 'provisioning',
+      envNames: ['API_TOKEN'],
+      reason: null,
+    });
+    const listed = await admin.request('GET', '/hosted-servers');
+    expect(JSON.stringify(listed.body)).not.toContain(value);
+    expect(JSON.stringify(created.body)).not.toContain(value);
+    const [task] = (await listHostedServerTasks(isolated)) as [HostedServerTask];
+    expect(task.env).not.toContain(value);
+    expect(JSON.parse(cipher.decrypt(task.env))).toEqual({ API_TOKEN: value });
+  });
+
+  it('refuses unpinned images, reserved variables, taken slugs and members', async () => {
+    const gateway = await startGateway(isolated);
+    const admin = await adminBrowser(gateway);
+    const host = (body: Record<string, unknown>) =>
+      admin.request('POST', '/hosted-servers', { ...everything, ...body });
+
+    expect((await host({ image: 'urumi/everything' })).status).toBe(400);
+    const latest = await host({ image: 'urumi/everything:latest' });
+    expect(latest.body.error).toBe('This server cannot be hosted: pin a version instead of latest.');
+    const reserved = await host({ env: { NODE_OPTIONS: '--require /tmp/x.js' } });
+    expect(reserved.body.error).toBe('This server cannot be hosted: NODE_OPTIONS is set by the platform.');
+    expect((await host({ path: 'mcp' })).status).toBe(400);
+    const [{ slug: serverSlug }] = (await isolated.query<{ slug: string }>('SELECT slug FROM upstreams')) as [
+      { slug: string },
+    ];
+    expect((await host({ slug: serverSlug })).status).toBe(409);
+    expect((await host({})).status).toBe(201);
+    expect((await host({})).status).toBe(409);
+    // The slug is reserved while the server is still deploying, so no upstream or store takes it.
+    expect((await admin.request('POST', '/upstreams', { name: 'Everything', url: 'http://x' })).status).toBe(
+      409,
+    );
+    const member = await newMember('member', isolated);
+    const browser = await new Browser(gateway).login(member.email, PASSWORD);
+    expect((await browser.request('POST', '/stores', { name: 'Everything' })).status).toBe(409);
+
+    expect((await browser.request('GET', '/hosted-servers')).status).toBe(403);
+    expect((await browser.request('POST', '/hosted-servers', { ...everything, slug: 'other' })).status).toBe(
+      403,
+    );
+  });
+
+  it('serves a ready server’s tools and removes them from clients as soon as it is deleted', async () => {
+    const gateway = await startGateway(isolated);
+    const hostedMcp = await startUpstream(['echo']);
+    onCleanup(() => hostedMcp.close());
+    const admin = await adminBrowser(gateway);
+    const { body } = await admin.request('POST', '/hosted-servers', everything);
+    const serverId = (body.server as HostedServer).id;
+
+    // What the provisioner does once the chart is installed, with the fake standing in for the image.
+    const [task] = (await listHostedServerTasks(isolated)) as [HostedServerTask];
+    expect(await markHostedServerReady(isolated, task)).toBe(true);
+    const [{ url }] = (await isolated.query<{ url: string }>(
+      'SELECT url FROM upstreams WHERE hosted_server_id = $1',
+      [serverId],
+    )) as [{ url: string }];
+    expect(url).toBe('http://server.mcp-everything.svc.cluster.local:3001/mcp');
+    await isolated.query('UPDATE upstreams SET url = $1 WHERE hosted_server_id = $2', [
+      hostedMcp.url,
+      serverId,
+    ]);
+    const upstreams = (await admin.request('GET', '/upstreams')).body.upstreams as Upstream[];
+    const hosted = upstreams.find((upstream) => upstream.hostedServerId === serverId)!;
+    expect((await admin.request('PATCH', `/upstreams/${hosted.id}`, { enabled: true })).status).toBe(200);
+    const edit = await admin.request('PATCH', `/upstreams/${hosted.id}`, { url: 'http://x' });
+    expect(edit.status).toBe(409);
+    expect(edit.body.error).toBe(
+      'This server is hosted by the platform. Delete it under Hosted servers instead.',
+    );
+    expect((await admin.request('DELETE', `/upstreams/${hosted.id}`)).status).toBe(409);
+
+    const member = await newMember('member', isolated);
+    const client = await mcpClient(gateway, await newKey(isolated, member));
+    const names = async () => (await client.listTools()).tools.map((tool) => tool.name);
+    expect(await names()).toContain('echo');
+
+    const deleted = await admin.request('DELETE', `/hosted-servers/${serverId}`);
+    expect(deleted.status).toBe(202);
+    expect(deleted.body.server).toMatchObject({ status: 'deleting' });
+    expect(await names()).not.toContain('echo');
+    expect(await listHostedServerTasks(isolated)).toMatchObject([{ id: serverId, status: 'deleting' }]);
+  });
+
+  it('retries only a failed server, as a new attempt', async () => {
+    const gateway = await startGateway(isolated);
+    const admin = await adminBrowser(gateway);
+    const { body } = await admin.request('POST', '/hosted-servers', everything);
+    const serverId = (body.server as HostedServer).id;
+    expect((await admin.request('POST', `/hosted-servers/${serverId}/retry`)).status).toBe(409);
+    expect((await admin.request('POST', `/hosted-servers/${randomUUID()}/retry`)).status).toBe(404);
+
+    const [task] = (await listHostedServerTasks(isolated)) as [HostedServerTask];
+    await markHostedServerFailed(isolated, task, 'The server did not become ready within 5 minutes.');
+    const retried = await admin.request('POST', `/hosted-servers/${serverId}/retry`);
+    expect(retried.body.server).toMatchObject({ status: 'provisioning', reason: null });
+    const [retriedTask] = (await listHostedServerTasks(isolated)) as [HostedServerTask];
+    expect(retriedTask.attempt).toBe(2);
+    // The old attempt finishing late changes nothing.
+    expect(await markHostedServerReady(isolated, task)).toBe(false);
   });
 });
 

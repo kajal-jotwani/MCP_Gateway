@@ -1,0 +1,5 @@
+apiVersion: v2
+name: hosted-mcp
+description: One MCP server run from a container image, reachable only by the gateway
+type: application
+version: 0.1.0

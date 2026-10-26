@@ -38,10 +38,11 @@ seccompProfile:
 
 {{/*
 Host names upstream URLs may use although they resolve to private addresses: the seeded store, the
-bundled upstreams under every name a Service has, provisioned stores, and upstreamNetwork.internalHosts.
+bundled upstreams under every name a Service has, provisioned stores, hosted servers, and
+upstreamNetwork.internalHosts.
 */}}
 {{- define "gateway.internalHosts" -}}
-{{- $hosts := list (urlParse .Values.seedUpstream.url).hostname "woo-mcp.store-*.svc.cluster.local" -}}
+{{- $hosts := list (urlParse .Values.seedUpstream.url).hostname "woo-mcp.store-*.svc.cluster.local" "server.mcp-*.svc.cluster.local" -}}
 {{- range $service := list "notes-mcp" "everything" -}}
 {{- range $suffix := list "" (printf ".%s" $.Release.Namespace) (printf ".%s.svc" $.Release.Namespace) (printf ".%s.svc.cluster.local" $.Release.Namespace) -}}
 {{- $hosts = append $hosts (printf "%s%s" $service $suffix) -}}

@@ -2,7 +2,16 @@ import { useState } from 'react';
 import type { FormEvent } from 'react';
 
 import { api, useAction, useApi } from './api';
-import type { AuthType, Member, Upstream, UpstreamStats, UpstreamStatus, UpstreamTool } from './api';
+import type {
+  AuthType,
+  HostedServer,
+  HostedServerStatus,
+  Member,
+  Upstream,
+  UpstreamStats,
+  UpstreamStatus,
+  UpstreamTool,
+} from './api';
 import { ErrorText, formatTime } from './ui';
 
 // Matches the gateway's refresh loop closely enough that a dead server shows as Unreachable within
@@ -47,6 +56,7 @@ export function ServersPage({ member }: { member: Member }) {
       {data?.upstreams.map((upstream) => (
         <ServerCard key={upstream.id} upstream={upstream} isAdmin={isAdmin} onChanged={reload} />
       ))}
+      {isAdmin && <HostedServers onChanged={reload} />}
     </>
   );
 }
@@ -90,6 +100,8 @@ function ServerCard({
 }) {
   const [editing, setEditing] = useState(false);
   const { busy, error, run } = useAction();
+  // The platform created these, so only enabling, disabling and access are changed here.
+  const managed = Boolean(upstream.storeId ?? upstream.hostedServerId);
 
   const setEnabled = (enabled: boolean) =>
     run(async () => {
@@ -148,9 +160,12 @@ function ServerCard({
       {upstream.storeId && (
         <p className="muted">Registered by its store. Delete the store on the Stores page to remove it.</p>
       )}
+      {upstream.hostedServerId && (
+        <p className="muted">Hosted by the platform. Delete it under Hosted servers to remove it.</p>
+      )}
       {isAdmin && (
         <div className="row">
-          {!upstream.storeId && (
+          {!managed && (
             <button type="button" disabled={busy} onClick={() => setEditing(true)}>
               Edit
             </button>
@@ -158,7 +173,7 @@ function ServerCard({
           <button type="button" disabled={busy} onClick={() => void setEnabled(!upstream.enabled)}>
             {upstream.enabled ? 'Disable' : 'Enable'}
           </button>
-          {!upstream.storeId && (
+          {!managed && (
             <button type="button" className="danger" disabled={busy} onClick={remove}>
               Remove
             </button>
@@ -317,6 +332,223 @@ function ServerForm({ existing, onDone }: { existing?: Upstream; onDone: () => v
           Cancel
         </button>
         {busy && <span className="muted">Saving and connecting…</span>}
+      </div>
+    </form>
+  );
+}
+
+const HOSTED_STATUS_LABELS: Record<HostedServerStatus, string> = {
+  provisioning: 'Deploying',
+  ready: 'Running',
+  failed: 'Failed',
+  deleting: 'Deleting',
+};
+
+/**
+ * Servers the platform runs from a container image, each in its own namespace. A ready one also
+ * appears above as an upstream; `onChanged` reloads that list after a delete removes it.
+ */
+function HostedServers({ onChanged }: { onChanged: () => void }) {
+  // The provisioner works in passes a few seconds apart, like for stores.
+  const { data, error, reload } = useApi<{ servers: HostedServer[] }>('/hosted-servers', 3000);
+  const [adding, setAdding] = useState(false);
+  const changed = () => {
+    reload();
+    onChanged();
+  };
+
+  return (
+    <>
+      <h2>Hosted servers</h2>
+      <p className="muted">
+        The platform runs these from a container image in their own namespace, with their environment in a
+        Secret, fixed resource limits and a NetworkPolicy that lets only the gateway reach them. Each is
+        registered as a server once it is running.
+      </p>
+      <ErrorText message={error} />
+      {adding ? (
+        <HostedServerForm
+          onDone={() => {
+            setAdding(false);
+            changed();
+          }}
+        />
+      ) : (
+        <button type="button" onClick={() => setAdding(true)}>
+          Host a server
+        </button>
+      )}
+      {data && data.servers.length > 0 && (
+        <table>
+          <thead>
+            <tr>
+              <th>Server</th>
+              <th>Status</th>
+              <th>Image</th>
+              <th>Environment</th>
+              <th>Created</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {data.servers.map((server) => (
+              <HostedServerRow key={server.id} server={server} onChanged={changed} />
+            ))}
+          </tbody>
+        </table>
+      )}
+    </>
+  );
+}
+
+function HostedServerRow({ server, onChanged }: { server: HostedServer; onChanged: () => void }) {
+  const { busy, error, run } = useAction();
+  const retry = () =>
+    void run(async () => {
+      await api('POST', `/hosted-servers/${server.id}/retry`);
+      onChanged();
+    });
+  const remove = () => {
+    if (!window.confirm(`Delete ${server.name}? Its tools disappear at once and its namespace is deleted.`)) {
+      return;
+    }
+    void run(async () => {
+      await api('DELETE', `/hosted-servers/${server.id}`);
+      onChanged();
+    });
+  };
+
+  return (
+    <tr>
+      <td>
+        {server.name} <code className="muted">{server.slug}</code>
+      </td>
+      <td>
+        <span className={`badge ${server.status}`}>{HOSTED_STATUS_LABELS[server.status]}</span>
+        {server.reason && <div className="error">{server.reason}</div>}
+      </td>
+      <td>
+        <code>{server.image}</code>
+        <div className="muted">
+          port {server.port}, path {server.path}
+        </div>
+      </td>
+      <td>{server.envNames.length ? server.envNames.join(', ') : <span className="muted">None</span>}</td>
+      <td>{formatTime(server.createdAt)}</td>
+      <td>
+        {server.status !== 'deleting' && (
+          <div className="row">
+            {server.status === 'failed' && (
+              <button type="button" disabled={busy} onClick={retry}>
+                Retry
+              </button>
+            )}
+            <button type="button" className="danger" disabled={busy} onClick={remove}>
+              Delete
+            </button>
+          </div>
+        )}
+        <ErrorText message={error} />
+      </td>
+    </tr>
+  );
+}
+
+/** Reads KEY=value lines. Throws on a line without "=", so a typo is not dropped silently. */
+function parseEnvLines(text: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    const separator = line.indexOf('=');
+    if (separator < 1) throw new Error(`Write each variable as NAME=value: ${line.slice(0, 40)}`);
+    env[line.slice(0, separator).trim()] = line.slice(separator + 1);
+  }
+  return env;
+}
+
+function HostedServerForm({ onDone }: { onDone: () => void }) {
+  const [name, setName] = useState('');
+  const [slug, setSlug] = useState('');
+  const [image, setImage] = useState('');
+  const [port, setPort] = useState('3000');
+  const [path, setPath] = useState('/mcp');
+  const [envText, setEnvText] = useState('');
+  const { busy, error, run } = useAction();
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    void run(async () => {
+      const body = {
+        name,
+        image,
+        port: Number(port),
+        path,
+        env: parseEnvLines(envText),
+        ...(slug && { slug }),
+      };
+      await api('POST', '/hosted-servers', body);
+      onDone();
+    });
+  };
+
+  return (
+    <form className="card" onSubmit={submit}>
+      <h2>Host a server</h2>
+      <label>
+        Name
+        <input required maxLength={100} value={name} onChange={(e) => setName(e.target.value)} />
+      </label>
+      <label>
+        Slug (names its namespace, and prefixes its tools on name collisions; 2-16 of a-z, 0-9 and -)
+        <input
+          pattern="[a-z0-9-]{2,16}"
+          placeholder="derived from the name"
+          value={slug}
+          onChange={(e) => setSlug(e.target.value)}
+        />
+      </label>
+      <label>
+        Container image, pinned to a version or digest
+        <input
+          required
+          placeholder="ghcr.io/org/mcp-server:1.2.0"
+          value={image}
+          onChange={(e) => setImage(e.target.value)}
+        />
+      </label>
+      <label>
+        Port the server listens on
+        <input
+          type="number"
+          required
+          min={1}
+          max={65535}
+          value={port}
+          onChange={(e) => setPort(e.target.value)}
+        />
+      </label>
+      <label>
+        MCP endpoint path (Streamable HTTP)
+        <input required value={path} onChange={(e) => setPath(e.target.value)} />
+      </label>
+      <label>
+        Environment, one NAME=value per line (stored encrypted and in a Secret, never shown again)
+        <textarea
+          rows={3}
+          autoComplete="off"
+          spellCheck={false}
+          value={envText}
+          onChange={(e) => setEnvText(e.target.value)}
+        />
+      </label>
+      <ErrorText message={error} />
+      <div className="row">
+        <button type="submit" disabled={busy}>
+          Host server
+        </button>
+        <button type="button" disabled={busy} onClick={onDone}>
+          Cancel
+        </button>
       </div>
     </form>
   );

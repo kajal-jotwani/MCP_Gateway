@@ -1,5 +1,6 @@
 import * as z from 'zod/v4';
 
+import type { HelmChart } from './cluster.js';
 import type { PostgresSettings } from './db.js';
 import { MIN_PASSWORD_LENGTH } from './team.js';
 import type { UpstreamNetworkPolicy } from './upstreamNetwork.js';
@@ -37,11 +38,12 @@ export interface ProvisionerConfig {
   gatewayNamespace: string;
   /** The provisioner's service account, which it grants `storeRole` in each store namespace. */
   serviceAccount: string;
-  /** The ClusterRole holding what helm needs inside a store namespace. */
+  /** The ClusterRole holding what helm needs inside a store or hosted server namespace. */
   storeRole: string;
-  chartPath: string;
-  /** Values files applied to every store, before its own values. */
-  valuesFiles: string[];
+  storeChart: HelmChart;
+  hostedServerChart: HelmChart;
+  /** Decrypts hosted servers' environment variables, which the gateway stored encrypted. */
+  credentialKey: Buffer;
   timeoutMs: number;
 }
 
@@ -117,6 +119,8 @@ const provisionerEnvSchema = z.object({
   STORE_ROLE: z.string().min(1),
   STORE_CHART_PATH: z.string().min(1),
   STORE_VALUES_FILE: z.string().min(1).optional(),
+  HOSTED_SERVER_CHART_PATH: z.string().min(1),
+  UPSTREAM_CREDENTIAL_KEY: aesKey,
   PROVISION_TIMEOUT_MINUTES: z.coerce.number().int().min(1).max(120),
 });
 
@@ -173,8 +177,13 @@ export function loadProvisionerConfig(env: NodeJS.ProcessEnv): ProvisionerConfig
     gatewayNamespace: vars.GATEWAY_NAMESPACE,
     serviceAccount: vars.PROVISIONER_SERVICE_ACCOUNT,
     storeRole: vars.STORE_ROLE,
-    chartPath: vars.STORE_CHART_PATH,
-    valuesFiles: vars.STORE_VALUES_FILE ? [vars.STORE_VALUES_FILE] : [],
+    storeChart: {
+      release: 'store',
+      path: vars.STORE_CHART_PATH,
+      valuesFiles: vars.STORE_VALUES_FILE ? [vars.STORE_VALUES_FILE] : [],
+    },
+    hostedServerChart: { release: 'server', path: vars.HOSTED_SERVER_CHART_PATH, valuesFiles: [] },
+    credentialKey: vars.UPSTREAM_CREDENTIAL_KEY,
     timeoutMs: vars.PROVISION_TIMEOUT_MINUTES * 60_000,
   };
 }

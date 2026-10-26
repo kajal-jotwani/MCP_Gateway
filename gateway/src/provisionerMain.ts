@@ -3,8 +3,9 @@ import { createServer } from 'node:http';
 import { createInClusterStoreCluster } from './cluster.js';
 import { loadProvisionerConfig } from './config.js';
 import type { ProvisionerConfig } from './config.js';
+import { createCredentialCipher } from './credentialCipher.js';
 import { createPostgresDatabase, migrate, waitForDatabase } from './db.js';
-import { Provisioner } from './provisioner.js';
+import { hostedServerKind, Provisioner, storeKind } from './provisioner.js';
 
 const TICK_INTERVAL_MS = 5000;
 // Liveness fails when no pass has finished for this long, which means the database or the loop is stuck.
@@ -26,12 +27,18 @@ await migrate(db);
 const provisioner = new Provisioner(
   db,
   createInClusterStoreCluster({
-    chartPath: config.chartPath,
-    valuesFiles: config.valuesFiles,
     serviceAccount: { name: config.serviceAccount, namespace: config.gatewayNamespace },
     storeRole: config.storeRole,
   }),
-  { timeoutMs: config.timeoutMs, gatewayNamespace: config.gatewayNamespace },
+  { timeoutMs: config.timeoutMs },
+  [
+    storeKind(config.storeChart, config.gatewayNamespace),
+    hostedServerKind(
+      config.hostedServerChart,
+      config.gatewayNamespace,
+      createCredentialCipher(config.credentialKey),
+    ),
+  ],
 );
 
 let lastPassAt = Date.now();

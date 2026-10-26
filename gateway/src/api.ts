@@ -13,6 +13,15 @@ import type { CredentialCipher } from './credentialCipher.js';
 import type { ChatEvent, ChatTurn } from './chat.js';
 import type { Database } from './db.js';
 import {
+  createHostedServer,
+  envNameRefusal,
+  getHostedServer,
+  imageRefusal,
+  listHostedServers,
+  requestHostedServerDeletion,
+  retryHostedServer,
+} from './hostedServers.js';
+import {
   approveAuthorization,
   checkAuthorizationRequest,
   deniedRedirect,
@@ -69,7 +78,7 @@ import {
   slugFromName,
   updateUpstream,
 } from './upstreams.js';
-import type { Upstream } from './upstreams.js';
+import type { ManagedUpstream, Upstream } from './upstreams.js';
 
 /** An error whose status and message are meant for the browser. */
 export class HttpError extends Error {
@@ -199,6 +208,18 @@ const accessBody = z.object({
   adminOnlyTools: z.array(z.string().min(1).max(128)).max(1000),
 });
 
+const hostedServerBody = z.object({
+  name: upstreamNameSchema,
+  slug: z.string().regex(STORE_SLUG_PATTERN, 'must be 2-16 characters of a-z, 0-9 and -').optional(),
+  image: z.string().max(300),
+  port: z.number().int().min(1).max(65535),
+  path: z
+    .string()
+    .max(200)
+    .regex(/^\/[A-Za-z0-9._~/-]*$/, 'must start with / and hold only URL path characters'),
+  env: z.record(z.string(), z.string().max(4000)).default({}),
+});
+
 const storeBody = z.object({
   name: z
     .string()
@@ -317,11 +338,17 @@ function upstreamView(
   };
 }
 
-function upstreamChangeRefusal(outcome: 'slug_taken' | 'secret_required' | 'store_managed'): HttpError {
+function upstreamChangeRefusal(outcome: 'slug_taken' | 'secret_required' | ManagedUpstream): HttpError {
   if (outcome === 'slug_taken')
-    return new HttpError(409, 'Another server or a store already uses this slug.');
+    return new HttpError(409, 'Another server, store or hosted server already uses this slug.');
   if (outcome === 'store_managed') {
     return new HttpError(409, 'This server belongs to a store. Delete the store on the Stores page instead.');
+  }
+  if (outcome === 'hosted_managed') {
+    return new HttpError(
+      409,
+      'This server is hosted by the platform. Delete it under Hosted servers instead.',
+    );
   }
   return new HttpError(
     400,
@@ -538,6 +565,59 @@ export function createApiRouter({
     res.json({ grant: await revokeOAuthGrant(db, grant.id) });
   });
 
+  // MCP servers the platform runs from a container image. The provisioner deploys them and registers
+  // each as an upstream once it is ready, so the routes here only record what admins ask for.
+  router.get('/hosted-servers', async (_req, res) => {
+    signedInAdmin(res);
+    res.json({ servers: await listHostedServers(db, cipher) });
+  });
+
+  router.post('/hosted-servers', async (req, res) => {
+    const admin = signedInAdmin(res);
+    const { slug, env, ...input } = parse(hostedServerBody, req.body);
+    const derivedSlug = slug ?? slugFromName(input.name);
+    if (!STORE_SLUG_PATTERN.test(derivedSlug)) {
+      throw new HttpError(400, 'Use a name with at least two letters or digits, or give a slug.');
+    }
+    const refusal =
+      imageRefusal(input.image) ??
+      Object.keys(env)
+        .map(envNameRefusal)
+        .find((reason) => reason !== undefined);
+    if (refusal) throw new HttpError(400, `This server cannot be hosted: ${refusal}.`);
+    if (Object.keys(env).length > 50) throw new HttpError(400, 'Use at most 50 environment variables.');
+    const server = await createHostedServer(db, cipher, {
+      ...input,
+      slug: derivedSlug,
+      env,
+      createdBy: admin.id,
+    });
+    if (server === 'slug_taken') throw upstreamChangeRefusal(server);
+    res.status(201).json({ server });
+  });
+
+  router.post('/hosted-servers/:id/retry', async (req, res) => {
+    signedInAdmin(res);
+    const id = parseId(req.params.id);
+    if (!(await retryHostedServer(db, id))) {
+      throw new HttpError(
+        (await getHostedServer(db, cipher, id)) ? 409 : 404,
+        'Only a failed server can be retried.',
+      );
+    }
+    res.json({ server: await getHostedServer(db, cipher, id) });
+  });
+
+  // Removing the upstream is part of the request, so the server's tools are gone from clients at once.
+  // The provisioner then deletes the namespace and, once it is gone, the row.
+  router.delete('/hosted-servers/:id', async (req, res) => {
+    signedInAdmin(res);
+    const id = parseId(req.params.id);
+    if (!(await requestHostedServerDeletion(db, id))) throw new HttpError(404, 'Not found.');
+    await applyUpstreamChanges();
+    res.status(202).json({ server: await getHostedServer(db, cipher, id) });
+  });
+
   router.get('/audit', async (req, res) => {
     const actor = signedInMember(res);
     const { before, limit } = parse(auditQuery, req.query);
@@ -603,7 +683,7 @@ export function createApiRouter({
     signedInAdmin(res);
     const deleted = await deleteUpstream(db, parseId(req.params.id));
     if (!deleted) throw new HttpError(404, 'Not found.');
-    if (deleted === 'store_managed') throw upstreamChangeRefusal(deleted);
+    if (typeof deleted === 'string') throw upstreamChangeRefusal(deleted);
     await applyUpstreamChanges();
     res.status(204).end();
   });

@@ -78,6 +78,24 @@ export interface Upstream {
   tools: UpstreamTool[];
   /** Set on a provisioned store's server, which is changed through its store. */
   storeId: string | null;
+  /** Set on a server the platform hosts, which is removed under Hosted servers. */
+  hostedServerId: string | null;
+}
+
+export type HostedServerStatus = 'provisioning' | 'ready' | 'failed' | 'deleting';
+
+/** An MCP server the platform runs from a container image. Environment values are never sent. */
+export interface HostedServer {
+  id: string;
+  slug: string;
+  name: string;
+  image: string;
+  port: number;
+  path: string;
+  envNames: string[];
+  status: HostedServerStatus;
+  reason: string | null;
+  createdAt: string;
 }
 
 export type StoreStatus = 'provisioning' | 'ready' | 'failed' | 'deleting';
