@@ -186,7 +186,8 @@ export class UpstreamRegistry {
   /**
    * Calls a tool on its upstream with the upstream's own credential and the call timeout.
    * Throws UpstreamCallError on timeout, transport failure, an HTTP error status or an upstream protocol
-   * error. A transport failure marks the upstream unreachable right away instead of at the next refresh.
+   * error. After a transport failure the upstream is checked before this returns, and marked unreachable
+   * if the check fails too.
    */
   async callTool(
     tool: RoutedTool,
@@ -205,7 +206,7 @@ export class UpstreamRegistry {
         { timeout: this.timeouts.callMs, signal },
       );
     } catch (error) {
-      throw this.toCallError(connection, client, tool.upstreamName, error, signal);
+      throw await this.toCallError(connection, client, tool.upstreamName, error, signal);
     }
     return forwardedResult(result, tool.upstreamName);
   }
@@ -315,13 +316,13 @@ export class UpstreamRegistry {
     });
   }
 
-  private toCallError(
+  private async toCallError(
     connection: Connection,
     client: Client,
     upstreamName: string,
     error: unknown,
     signal: AbortSignal | undefined,
-  ): UpstreamCallError {
+  ): Promise<UpstreamCallError> {
     if (signal?.aborted) return new UpstreamCallError('failed', 'The call was cancelled by the client.');
     if (error instanceof SdkError && error.code === SdkErrorCode.RequestTimeout) {
       return new UpstreamCallError(
@@ -343,13 +344,18 @@ export class UpstreamRegistry {
       return new UpstreamCallError('failed', `Upstream "${upstreamName}" answered HTTP ${error.status}.`);
     }
     const reason = describeFailure(error);
-    if (connection.client === client && this.isCurrent(connection)) {
-      this.disconnect(connection);
-      this.setStatus(connection, 'unreachable', reason, Date.now());
-      connection.checkedAt = new Date();
-      this.publish();
+    // A transport failure can mean the upstream is gone, or only that it refused this request and
+    // closed the connection, as some servers do with an oversized body. A check decides, before the
+    // caller gets an answer, so a dead upstream's tools are hidden at once and one caller cannot hide
+    // a working upstream's tools from everyone.
+    if (connection.client === client && this.isCurrent(connection)) await this.refresh(connection);
+    if (connection.status === 'unreachable') {
+      return new UpstreamCallError('failed', unreachableMessage(upstreamName, connection.error ?? reason));
     }
-    return new UpstreamCallError('failed', unreachableMessage(upstreamName, reason));
+    return new UpstreamCallError(
+      'failed',
+      `Upstream "${upstreamName}" did not complete the call: ${reason}.`,
+    );
   }
 
   private isCurrent(connection: Connection): boolean {

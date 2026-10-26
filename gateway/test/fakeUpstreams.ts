@@ -50,10 +50,17 @@ async function closeServer(server: Server): Promise<void> {
  * `fail` throws. With a token, requests without `Authorization: Bearer <token>` get 401. Tools are
  * read from `toolNames` on each request, so changing the array changes what the server lists.
  * `maxSubscriptions` limits the open change-notification streams. It listens on `host`, loopback by default.
+ * `resetBodiesOver` drops the connection of any request with a larger body, as some servers do.
  */
 export async function startUpstream(
   toolNames: string[],
-  options: { token?: string; port?: number; host?: string; maxSubscriptions?: number } = {},
+  options: {
+    token?: string;
+    port?: number;
+    host?: string;
+    maxSubscriptions?: number;
+    resetBodiesOver?: number;
+  } = {},
 ): Promise<FakeUpstream> {
   const calls: ReceivedCall[] = [];
   const createServerForRequest = (): McpServer => {
@@ -77,6 +84,13 @@ export async function startUpstream(
   });
   const node = toNodeHandler(handler);
   const server = createServer((req, res) => {
+    if (
+      options.resetBodiesOver !== undefined &&
+      Number(req.headers['content-length']) > options.resetBodiesOver
+    ) {
+      req.socket.destroy();
+      return;
+    }
     if (options.token && req.headers.authorization !== `Bearer ${options.token}`) {
       res.writeHead(401).end();
       return;

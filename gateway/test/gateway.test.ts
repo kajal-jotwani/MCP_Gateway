@@ -344,9 +344,26 @@ describe('gateway core', () => {
     const woo = await startUpstream(['list_orders']);
     const { client, registry } = await startGateway([upstream('woocommerce', 'WooCommerce', woo.url)]);
 
-    // Over the upstream SDK's 4 MiB request limit, so the upstream answers 413.
+    // Over the upstream SDK's 4 MiB request limit, so the upstream answers 413. It may close the
+    // connection while the body is still being sent, and then the gateway sees a dropped connection.
     const oversized = registry.callTool(registry.resolve('list_orders')!, { padding: 'x'.repeat(4_300_000) });
-    await expect(oversized).rejects.toThrow('Upstream "WooCommerce" answered HTTP 413.');
+    await expect(oversized).rejects.toThrow(
+      /^Upstream "WooCommerce" (answered HTTP 413|did not complete the call: the connection was (reset|closed unexpectedly))\.$/,
+    );
+
+    expect(registry.states().get('id-woocommerce')?.status).toBe('connected');
+    expect(await toolNames(client)).toEqual(['list_orders']);
+    expect(text(await client.callTool({ name: 'list_orders', arguments: {} }))).toBe('list_orders done');
+  });
+
+  it('keeps an upstream connected when it drops the connection of one call', async () => {
+    const woo = await startUpstream(['list_orders'], { resetBodiesOver: 10_000 });
+    const { client, registry } = await startGateway([upstream('woocommerce', 'WooCommerce', woo.url)]);
+
+    const dropped = registry.callTool(registry.resolve('list_orders')!, { padding: 'x'.repeat(20_000) });
+    await expect(dropped).rejects.toThrow(
+      'Upstream "WooCommerce" did not complete the call: the connection was closed unexpectedly.',
+    );
 
     expect(registry.states().get('id-woocommerce')?.status).toBe('connected');
     expect(await toolNames(client)).toEqual(['list_orders']);
