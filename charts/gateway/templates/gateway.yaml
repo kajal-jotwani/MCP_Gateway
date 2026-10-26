@@ -50,6 +50,9 @@ spec:
               value: {{ .Values.seedUpstream.slug | quote }}
             - name: SEED_UPSTREAM_URL
               value: {{ .Values.seedUpstream.url | quote }}
+            # The server-side request forgery guard refuses private addresses except for these hosts.
+            - name: UPSTREAM_INTERNAL_HOSTS
+              value: {{ include "gateway.internalHosts" . | quote }}
             - name: STORE_DOMAIN
               value: {{ required "Set stores.domain to the domain stores are served under, such as example.com." .Values.stores.domain | quote }}
             - name: MAX_STORES_PER_MEMBER

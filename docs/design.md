@@ -289,6 +289,23 @@ The gateway process does hold state in memory: the upstream clients, the tool ca
 
 Auth and audit would still be correct, because they read and write PostgreSQL on every request. The chart runs one replica; during a rolling update the old and new pods overlap for a few seconds, which the periodic re-read covers. Fixing the above would mean `LISTEN/NOTIFY` for admin changes and storing status in PostgreSQL; that is the scaling extension and out of scope.
 
+### Server-side request forgery guard
+
+An admin's upstream URL becomes a request from inside the cluster. Without a guard, the URL `http://169.254.169.254/` reads cloud credentials on a VPS, and `https://kubernetes.default.svc` or `http://postgres:5432` probe services that trust the cluster network.
+
+Options considered: an allow list of URLs (safest, but every new server needs a chart change), checking the URL only when it is saved (defeated by DNS rebinding: the name resolves to a public address at save time and to an internal one later), and a check on the address of every connection.
+
+**Decision: address checks on every connection, plus a check on save for a clear error.**
+
+- Always refused, for every host: `0.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16` (link-local, which includes the AWS, GCP and Azure metadata endpoint), Alibaba's `100.100.100.200`, multicast and reserved IPv4, `::`/`::1`, `fe80::/10`, AWS's IPv6 metadata `fd00:ec2::254` and IPv6 multicast. IPv4-mapped IPv6 addresses are checked as IPv4.
+- Refused unless the host name is on the internal list: private and cluster-internal ranges, `10.0.0.0/8` (which holds k3s's pod and Service ranges), `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` and `fc00::/7`. The chart builds the list from what it knows: the seeded store's host, `notes-mcp` and `everything` under every name their Services answer to (short name to `.svc.cluster.local`), `woo-mcp.store-*.svc.cluster.local` for provisioned stores, plus `upstreamNetwork.internalHosts`. A `*` matches part of one DNS label. The Kubernetes API, PostgreSQL and the provisioner are not on it.
+- On every connection: the registry's MCP clients use undici's fetch with an Agent whose DNS lookup checks every address a host resolves to, and refuses the connection if any is blocked. An IP address in the URL is checked before the request. The Node fetch bundled with the runtime is not used for upstreams, so the guard does not depend on which undici version Node ships.
+- On save: `POST` and `PATCH /api/upstreams` resolve the host and answer 400 `This URL cannot be used: ...` for a refused address. A host that does not resolve is accepted, as before, and shows as Unreachable.
+- A refused connection shows as Unreachable with `blocked by the gateway's network policy: ...`.
+- Redirects were already refused (`redirect: 'error'`), so a public server cannot bounce the gateway to an internal address.
+
+Tradeoff: an upstream on a private network, such as another team's MCP server on the VPS provider's internal network, needs its host added to `upstreamNetwork.internalHosts` before it can be registered.
+
 ### Tool permissions
 
 Options considered: per-member allow lists, per-role rules, or scopes on API keys. The brief's example (members read orders, only admins create products or change order status) is a rule about roles, and the team has two roles, so a rule per role covers it without a policy language.
@@ -429,6 +446,7 @@ Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and ever
 | T2 | `urk_` keys, SHA-256, revocation checked on every call |
 | T4, D9 | `writeAuditEntry` in the single tool-call path, audit page in the dashboard |
 | C1, C2, C3 | Claude Messages API loop in the gateway using the same path, tool calls streamed to the UI, key in a Secret |
+| SSRF guard | Address checks in the upstream clients' DNS lookup on every connection and on save; internal host list from the chart |
 | Tool permissions | `upstreams.admin_only` and `admin_only_tools`; `mayCallTool` in listing (`toolsFor`) and in the single call path |
 | Observability | Failure reasons from the error cause chain; per-server stats from `audit_entries`; Prometheus `/metrics` on port 9464 |
 | Multi-store bonus | `stores` table and Stores page; provisioner running Helm per namespace `store-<slug>`; RBAC bound per store namespace plus an admission policy; quota, LimitRange, per-member limit and timeout; woo-mcp egress policy; store tools always `<slug>__<tool>` |

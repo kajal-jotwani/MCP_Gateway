@@ -35,8 +35,8 @@ export async function runCleanups(): Promise<void> {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 }
 
-async function listen(server: Server, port = 0): Promise<number> {
-  await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
+async function listen(server: Server, port = 0, host = '127.0.0.1'): Promise<number> {
+  await new Promise<void>((resolve) => server.listen(port, host, resolve));
   return (server.address() as AddressInfo).port;
 }
 
@@ -49,11 +49,11 @@ async function closeServer(server: Server): Promise<void> {
  * An MCP server on a real port whose tools echo their name and arguments. `sleep` waits for args.ms,
  * `fail` throws. With a token, requests without `Authorization: Bearer <token>` get 401. Tools are
  * read from `toolNames` on each request, so changing the array changes what the server lists.
- * `maxSubscriptions` limits the open change-notification streams.
+ * `maxSubscriptions` limits the open change-notification streams. It listens on `host`, loopback by default.
  */
 export async function startUpstream(
   toolNames: string[],
-  options: { token?: string; port?: number; maxSubscriptions?: number } = {},
+  options: { token?: string; port?: number; host?: string; maxSubscriptions?: number } = {},
 ): Promise<FakeUpstream> {
   const calls: ReceivedCall[] = [];
   const createServerForRequest = (): McpServer => {
@@ -83,7 +83,8 @@ export async function startUpstream(
     }
     void node(req, res);
   });
-  const port = await listen(server, options.port);
+  const host = options.host ?? '127.0.0.1';
+  const port = await listen(server, options.port, host);
   let closed = false;
   const close = async (): Promise<void> => {
     if (closed) return;
@@ -93,7 +94,7 @@ export async function startUpstream(
   };
   onCleanup(close);
   return {
-    url: `http://127.0.0.1:${port}/mcp`,
+    url: `http://${host}:${port}/mcp`,
     port,
     calls,
     notifyToolsChanged: () => handler.notify.toolsChanged(),

@@ -22,6 +22,7 @@ import type { Member, Role } from '../src/team.js';
 import { listStoreTasks, markStoreFailed, markStoreReady } from '../src/stores.js';
 import type { StoreTask } from '../src/stores.js';
 import { startMetricsServer } from '../src/metrics.js';
+import { upstreamUrlRefusal } from '../src/upstreamNetwork.js';
 import { listUpstreamConfigs } from '../src/upstreams.js';
 import type { Upstream } from '../src/upstreams.js';
 import { createTestDatabase } from './database.js';
@@ -73,9 +74,13 @@ const unusedAnthropic = new Anthropic({ apiKey: 'unused', baseURL: 'http://127.0
  * Starts the gateway's HTTP app on a free port, with one upstream named WooCommerce. With the shared
  * database, the gateway starts out seeing only its own upstream row.
  */
+// Fake upstreams listen on loopback, which the real guard always refuses. Its own tests cover it.
+const allowEveryUrl = async (): Promise<undefined> => undefined;
+
 async function startGateway(
   database: Database = db,
   anthropic: Anthropic = unusedAnthropic,
+  checkUpstreamUrl: (url: string) => Promise<string | undefined> = allowEveryUrl,
 ): Promise<Gateway> {
   const upstream = await startUpstream(['list_orders', 'fail', 'sleep']);
   upstreamCounter += 1;
@@ -93,6 +98,7 @@ async function startGateway(
     anthropic,
     publicUrl: new URL('http://app.localtest.me'),
     stores: { domain: 'localtest.me', maxPerMember: 2 },
+    checkUpstreamUrl,
     dashboardDir,
   });
   const server: Server = await new Promise((resolve) => {
@@ -631,6 +637,31 @@ describe('upstream servers', () => {
       403,
     );
     expect((await browser.request('DELETE', `/upstreams/${upstream!.id}`)).status).toBe(403);
+  });
+
+  it('refuses upstream URLs that point at metadata endpoints or private addresses', async () => {
+    const policy = { internalHosts: ['notes-mcp'] };
+    const gateway = await startGateway(isolated, unusedAnthropic, (url) => upstreamUrlRefusal(url, policy));
+    const admin = await adminBrowser(gateway);
+
+    const metadata = await admin.request('POST', '/upstreams', {
+      name: 'M',
+      url: 'http://169.254.169.254/mcp',
+    });
+    expect(metadata.status).toBe(400);
+    expect(metadata.body.error).toMatch(
+      /^This URL cannot be used: the address is loopback, link-local or a cloud metadata endpoint/,
+    );
+    const privateAddress = await admin.request('POST', '/upstreams', {
+      name: 'P',
+      url: 'http://10.43.0.1/mcp',
+    });
+    expect(privateAddress.body.error).toMatch(/private or cluster-internal address/);
+    const [upstream] = (await admin.request('GET', '/upstreams')).body.upstreams as { id: string }[];
+    const moved = await admin.request('PATCH', `/upstreams/${upstream!.id}`, {
+      url: 'http://[::ffff:127.0.0.1]/mcp',
+    });
+    expect(moved.status).toBe(400);
   });
 
   it('gives admins calls, errors and latency per server from the audit log', async () => {

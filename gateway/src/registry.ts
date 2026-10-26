@@ -10,6 +10,8 @@ import type { CallToolResult, McpSubscription, Tool } from '@modelcontextprotoco
 
 import { exposeToolNames } from './toolNames.js';
 import type { ExposedTool } from './toolNames.js';
+import { BlockedAddressError } from './upstreamNetwork.js';
+import type { UpstreamFetch } from './upstreamNetwork.js';
 
 export type UpstreamStatus = 'connected' | 'unreachable' | 'disabled';
 
@@ -88,7 +90,11 @@ export class UpstreamRegistry {
   private visibleSignature = '[]';
   private reloading = Promise.resolve();
 
-  constructor(private readonly timeouts: RegistryTimeouts) {}
+  /** `fetch` makes every upstream request; the gateway passes one that applies its network policy. */
+  constructor(
+    private readonly timeouts: RegistryTimeouts,
+    private readonly fetch?: UpstreamFetch,
+  ) {}
 
   /** Registers a listener that runs whenever the tools clients can see change. */
   onToolsChanged(listener: () => void): void {
@@ -251,6 +257,7 @@ export class UpstreamRegistry {
       },
     );
     const transport = new StreamableHTTPClientTransport(new URL(url), {
+      fetch: this.fetch,
       // redirect: 'error' keeps the credential from following a redirect to another host.
       requestInit: {
         headers: credential ? { [credential.header]: credential.value } : {},
@@ -490,6 +497,8 @@ export function describeFailure(error: unknown): string {
       return 'the server did not answer as an MCP server (unexpected content type)';
     }
     if (cause instanceof ProtocolError) return `protocol error ${cause.code}`;
+    if (cause instanceof BlockedAddressError)
+      return `blocked by the gateway's network policy: ${cause.message}`;
     if (!(cause instanceof Error)) continue;
     if (cause.message === 'unexpected redirect') {
       return 'the server answered with a redirect, which the gateway does not follow';

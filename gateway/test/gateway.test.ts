@@ -1,3 +1,5 @@
+import { networkInterfaces } from 'node:os';
+
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import type { McpHttpHandler } from '@modelcontextprotocol/server';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -6,6 +8,7 @@ import type { Queryable } from '../src/db.js';
 import { callerAuthInfo, createGatewayMcpHandler } from '../src/mcpEndpoint.js';
 import { UpstreamRegistry } from '../src/registry.js';
 import type { UpstreamConfig } from '../src/registry.js';
+import { createGuardedFetch } from '../src/upstreamNetwork.js';
 import {
   deadUrl,
   eventually,
@@ -209,6 +212,39 @@ describe('gateway core', () => {
     expect(registry.states().get('id-moved')?.error).toBe(
       'the server answered with a redirect, which the gateway does not follow',
     );
+  });
+
+  // The guard refuses loopback, so this needs an address of another interface of this machine.
+  const lanAddress = Object.values(networkInterfaces())
+    .flat()
+    .find((iface) => iface?.family === 'IPv4' && !iface.internal)?.address;
+
+  it.skipIf(!lanAddress)(
+    'lists and calls tools through the network guard on an allowed address',
+    async () => {
+      const woo = await startUpstream(['list_orders'], { host: lanAddress });
+      const registry = new UpstreamRegistry(TIMEOUTS, createGuardedFetch({ internalHosts: [lanAddress!] }));
+      onCleanup(() => registry.close());
+      await registry.sync([upstream('woocommerce', 'WooCommerce', woo.url)]);
+
+      expect(registry.states().get('id-woocommerce')?.status).toBe('connected');
+      const result = await registry.callTool(registry.resolve('list_orders')!, {});
+      expect(text(result)).toBe('list_orders done');
+    },
+  );
+
+  it('reports an upstream the network policy refuses as unreachable', async () => {
+    const woo = await startUpstream(['list_orders']);
+    const registry = new UpstreamRegistry(TIMEOUTS, createGuardedFetch({ internalHosts: [] }));
+    onCleanup(() => registry.close());
+    await registry.sync([upstream('woocommerce', 'WooCommerce', woo.url.replace('127.0.0.1', 'localhost'))]);
+
+    expect(registry.states().get('id-woocommerce')).toMatchObject({
+      status: 'unreachable',
+      error:
+        "blocked by the gateway's network policy: the address is loopback, link-local or a cloud metadata endpoint, which upstreams may never use",
+    });
+    expect(woo.calls).toEqual([]);
   });
 
   it('reports an upstream that rejects the gateway’s credential', async () => {

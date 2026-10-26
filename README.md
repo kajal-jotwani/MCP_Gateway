@@ -117,6 +117,8 @@ WooCommerce is registered as a server on the gateway's first start. Add the othe
 
 All three should show **Connected** with their tools.
 
+The gateway refuses upstream URLs that point at loopback, link-local or cloud metadata addresses, and at private or cluster-internal addresses unless the host is on its internal list (these servers, the stores, and `upstreamNetwork.internalHosts` in the gateway chart). An MCP server inside the cluster or on a private network needs its host name added there first, for example `my-mcp.tools.svc.cluster.local`.
+
 ### Local domain approach
 
 `localtest.me` is a public DNS name whose every subdomain resolves to 127.0.0.1, so `store.localtest.me` and `app.localtest.me` reach the k3d load balancer on port 80 without any local configuration, from browsers and from command-line MCP clients alike. If you are offline or your DNS resolver filters such answers, add this line to `/etc/hosts`:

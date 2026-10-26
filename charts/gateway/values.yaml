@@ -40,6 +40,13 @@ ingress:
   # Where the controller's pods run. The NetworkPolicies let only this namespace reach the gateway.
   controllerNamespace: kube-system
 
+upstreamNetwork:
+  # Host names an upstream URL may use although they resolve to a private or cluster-internal
+  # address, such as my-mcp.tools.svc.cluster.local. A * matches part of one label. The seeded store,
+  # notes-mcp, everything and provisioned stores are always allowed. Loopback, link-local and cloud
+  # metadata addresses are refused for every host.
+  internalHosts: []
+
 metrics:
   # A namespace whose pods may scrape the gateway's Prometheus metrics on port 9464, such as
   # monitoring. Empty: only `kubectl port-forward` reaches them.

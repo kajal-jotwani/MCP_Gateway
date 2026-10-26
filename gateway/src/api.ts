@@ -76,6 +76,8 @@ export interface ApiDeps {
   anthropic: Anthropic;
   publicUrl: URL;
   stores: { domain: string; maxPerMember: number };
+  /** Why an upstream URL may not be used (server-side request forgery guard), or undefined. */
+  checkUpstreamUrl: (url: string) => Promise<string | undefined>;
 }
 
 const SESSION_COOKIE = 'urumi_session';
@@ -320,11 +322,22 @@ function storeCreateRefusal(outcome: CreateStoreRefusal, maxPerMember: number): 
 }
 
 /** The dashboard API under /api. Humans authenticate with a session cookie set by /api/login. */
-export function createApiRouter({ db, registry, anthropic, publicUrl, stores }: ApiDeps): Router {
+export function createApiRouter({
+  db,
+  registry,
+  anthropic,
+  publicUrl,
+  stores,
+  checkUpstreamUrl,
+}: ApiDeps): Router {
   const router = express.Router();
   const secureCookie = publicUrl.protocol === 'https:';
 
   const applyUpstreamChanges = (): Promise<void> => registry.reload(() => listUpstreamConfigs(db));
+  const assertUsableUrl = async (url: string | undefined): Promise<void> => {
+    const refusal = url && (await checkUpstreamUrl(url));
+    if (refusal) throw new HttpError(400, `This URL cannot be used: ${refusal}.`);
+  };
   const upstreamResponse = async (upstream: Upstream, admin: Member) => ({
     upstream: upstreamView(
       upstream,
@@ -482,6 +495,7 @@ export function createApiRouter({ db, registry, anthropic, publicUrl, stores }: 
   router.post('/upstreams', async (req, res) => {
     const admin = signedInAdmin(res);
     const { slug, ...input } = parse(upstreamBody, req.body);
+    await assertUsableUrl(input.url);
     const derivedSlug = slug ?? slugFromName(input.name);
     if (!SLUG_PATTERN.test(derivedSlug)) {
       throw new HttpError(400, 'Enter a slug of 2-16 characters of a-z, 0-9 and -.');
@@ -495,6 +509,7 @@ export function createApiRouter({ db, registry, anthropic, publicUrl, stores }: 
   router.patch('/upstreams/:id', async (req, res) => {
     const admin = signedInAdmin(res);
     const changes = parse(upstreamPatchBody, req.body);
+    await assertUsableUrl(changes.url);
     const updated = await updateUpstream(db, parseId(req.params.id), changes);
     if (!updated) throw new HttpError(404, 'Not found.');
     if (typeof updated === 'string') throw upstreamChangeRefusal(updated);

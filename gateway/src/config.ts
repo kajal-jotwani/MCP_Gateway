@@ -2,6 +2,7 @@ import * as z from 'zod/v4';
 
 import type { PostgresSettings } from './db.js';
 import { MIN_PASSWORD_LENGTH } from './team.js';
+import type { UpstreamNetworkPolicy } from './upstreamNetwork.js';
 import { SLUG_PATTERN } from './upstreams.js';
 
 export interface GatewayConfig {
@@ -17,6 +18,7 @@ export interface GatewayConfig {
   seedUpstream: { name: string; slug: string; url: string };
   /** The chat agent's key for the Claude API. */
   anthropicApiKey: string;
+  upstreamNetwork: UpstreamNetworkPolicy;
   stores: {
     /** Provisioned stores are served at store-<slug>.<domain>, with the scheme of publicUrl. */
     domain: string;
@@ -48,6 +50,26 @@ const domainName = z
     'must be a DNS name',
   );
 
+// A host name in which `*` may stand for part of a label, such as woo-mcp.store-*.svc.cluster.local.
+const hostPatternList = z
+  .string()
+  .transform((value) =>
+    value
+      .split(',')
+      .map((part) => part.trim().toLowerCase())
+      .filter(Boolean),
+  )
+  .pipe(
+    z.array(
+      z
+        .string()
+        .regex(
+          /^[a-z0-9*]([a-z0-9*-]*[a-z0-9*])?(\.[a-z0-9*]([a-z0-9*-]*[a-z0-9*])?)*$/,
+          'must be host names, * allowed',
+        ),
+    ),
+  );
+
 const databaseEnv = {
   PGHOST: z.string().min(1),
   PGPORT: z.coerce.number().int().min(1).max(65535).default(5432),
@@ -69,6 +91,7 @@ const envSchema = z.object({
   SEED_UPSTREAM_SLUG: z.string().regex(SLUG_PATTERN, 'must be 2-16 characters of a-z, 0-9 and -'),
   SEED_UPSTREAM_URL: httpUrl,
   ANTHROPIC_API_KEY: z.string().min(1),
+  UPSTREAM_INTERNAL_HOSTS: hostPatternList.default([]),
   STORE_DOMAIN: domainName,
   MAX_STORES_PER_MEMBER: z.coerce.number().int().min(0).max(100),
 });
@@ -121,6 +144,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): GatewayConfig {
       url: vars.SEED_UPSTREAM_URL,
     },
     anthropicApiKey: vars.ANTHROPIC_API_KEY,
+    upstreamNetwork: { internalHosts: vars.UPSTREAM_INTERNAL_HOSTS },
     stores: { domain: vars.STORE_DOMAIN, maxPerMember: vars.MAX_STORES_PER_MEMBER },
   };
 }

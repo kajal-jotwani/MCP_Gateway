@@ -11,6 +11,7 @@ import { createGatewayMcpHandler } from './mcpEndpoint.js';
 import { reportUpstreamStates, startMetricsServer } from './metrics.js';
 import { UpstreamRegistry } from './registry.js';
 import { ensureFirstAdmin } from './team.js';
+import { createGuardedFetch, upstreamUrlRefusal } from './upstreamNetwork.js';
 import { listUpstreamConfigs, seedUpstreamOnce } from './upstreams.js';
 
 // Upstreams are in-cluster, so a healthy one answers in milliseconds. Calls get longer because store
@@ -44,7 +45,7 @@ if (await seedUpstreamOnce(db, config.seedUpstream)) {
   console.log(JSON.stringify({ event: 'upstream_seeded', upstream: config.seedUpstream.slug }));
 }
 
-const registry = new UpstreamRegistry(TIMEOUTS);
+const registry = new UpstreamRegistry(TIMEOUTS, createGuardedFetch(config.upstreamNetwork));
 const mcpHandler = createGatewayMcpHandler({ db, registry });
 const app = createApp({
   db,
@@ -53,6 +54,7 @@ const app = createApp({
   anthropic: new Anthropic({ apiKey: config.anthropicApiKey }),
   publicUrl: config.publicUrl,
   stores: config.stores,
+  checkUpstreamUrl: (url) => upstreamUrlRefusal(url, config.upstreamNetwork),
   dashboardDir: DASHBOARD_DIR,
 });
 const server = app.listen(config.port, () => {
