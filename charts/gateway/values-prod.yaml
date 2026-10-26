@@ -6,7 +6,7 @@ publicUrl: ''
 images:
   # Built and pushed to GHCR as described in the README. The packages must be public, because the
   # chart uses no image pull secret.
-  gateway: ghcr.io/kajal-jotwani/gateway:0.2.0
+  gateway: ghcr.io/kajal-jotwani/gateway:0.3.0
   notesMcp: ghcr.io/kajal-jotwani/notes-mcp:0.1.0
   everything: ghcr.io/kajal-jotwani/everything:2.0.0
 

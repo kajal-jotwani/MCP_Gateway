@@ -9,17 +9,24 @@ What runs in the cluster:
 | `store` | WordPress + WooCommerce, MariaDB, setup Job, `woo-mcp` (the WooCommerce MCP server in this repo) | `store.<domain>` (storefront and wp-admin) |
 | `gateway` | gateway (backend, MCP endpoint, chat agent, dashboard), store provisioner, PostgreSQL, `notes-mcp`, `server-everything` | `app.<domain>` (dashboard, `/api`, `/mcp`) |
 | `store-<slug>`, one per store created on the Stores page | the same as `store`, installed by the provisioner from the same chart | `store-<slug>.<domain>` |
+| `mcp-<slug>`, one per hosted MCP server | the server's container, installed by the provisioner from `charts/hosted-mcp` | none |
 
 `woo-mcp`, the databases and the two extra upstreams have no Ingress and accept traffic only from their own clients (NetworkPolicies). How it works and why: [docs/design.md](docs/design.md). Risks and limits: [docs/threat-model.md](docs/threat-model.md).
 
-Optional work: multi-store provisioning is implemented. Members create and delete stores on the dashboard's Stores page, and each store is registered in the gateway on its own; see [Create and delete stores](#create-and-delete-stores) and "Multi-store provisioning" in [docs/design.md](docs/design.md). Of the other stand-out items, these are done in part:
+Optional work, all implemented except a live VPS deployment:
 
-- Upgrades and rollback: Helm upgrade with automatic rollback, tested with a bad image tag; see [Upgrades, rollback and backups](#upgrades-rollback-and-backups) and "Upgrade and rollback" in [docs/design.md](docs/design.md).
-- Security hardening: default-deny ingress NetworkPolicies in both namespaces, and non-root containers with all capabilities dropped (one init container runs as root with only `CHOWN`). Only the store provisioner uses the Kubernetes API. Its RBAC grants nothing in existing namespaces, and an admission policy limits it to the namespaces it created. The gateway, woo-mcp and upstream pods mount no service account token. Not done: an SSRF guard for upstream URLs and encryption of upstream credentials at rest ([docs/threat-model.md](docs/threat-model.md)).
-- Observability: the Servers page shows why an upstream is Unreachable, and each audit entry gives the reason a call failed or was rejected. There are no metrics.
+- Multi-store provisioning: members create and delete stores on the Stores page, and each is registered in the gateway on its own. See [Create and delete stores](#create-and-delete-stores).
+- Tool permissions: admins limit a whole server or single tools to admins. See [Limit tools to admins](#limit-tools-to-admins).
+- OAuth: MCP clients can sign in through the gateway's own authorization server instead of using a key. See [Connect with OAuth instead of a key](#connect-with-oauth-instead-of-a-key).
+- Many tools: `/mcp/search` exposes `search_tools` and `call_tool` instead of every tool, and the chat agent switches to them above 40 tools. See [Connect an external MCP client](#connect-an-external-mcp-client).
+- Hosted MCP servers: admins add a server by container image, and the platform runs it in its own namespace with its own Secret, limits and NetworkPolicy. See [Host an MCP server from an image](#host-an-mcp-server-from-an-image).
+- Security hardening: default-deny ingress and egress NetworkPolicies, non-root containers with no capabilities, an SSRF guard on upstream URLs, upstream credentials encrypted at rest, and a provisioner whose Kubernetes rights are limited to namespaces it created.
+- Scaling: two gateway replicas kept in step through PostgreSQL, and a per-member limit on tool calls. See [Rate limit and replicas](#rate-limit-and-replicas).
+- Observability: per-server call counts, error rates and latency on the Servers page, failure reasons in the audit log, and Prometheus metrics. See [Metrics](#metrics).
+- Upgrades and rollback: Helm upgrades with automatic rollback, and the steps per component. See [Upgrades, rollback and backups](#upgrades-rollback-and-backups).
 - Production-like deployment: `values-prod.yaml` and the [VPS setup](#vps-setup-k3s) steps, rehearsed on a k3s test cluster but not deployed to a public VPS.
 
-Not attempted: tool permissions per role or user, OAuth on the gateway, search-then-execute for many tools, hosting MCP servers from container images, and more than one gateway replica or rate limits.
+The reasons for each choice are in [docs/design.md](docs/design.md), and the risks that remain in [docs/threat-model.md](docs/threat-model.md).
 
 ## Requirements
 
@@ -47,8 +54,8 @@ This maps port 80 on your machine to the cluster's Traefik Ingress controller. k
 docker build -f woo-mcp/Dockerfile -t urumi/woo-mcp:0.1.0 .
 docker build -f notes-mcp/Dockerfile -t urumi/notes-mcp:0.1.0 .
 docker build -f everything/Dockerfile -t urumi/everything:2.0.0 .
-docker build -f gateway/Dockerfile -t urumi/gateway:0.2.0 .
-k3d image import -c urumi urumi/woo-mcp:0.1.0 urumi/notes-mcp:0.1.0 urumi/everything:2.0.0 urumi/gateway:0.2.0
+docker build -f gateway/Dockerfile -t urumi/gateway:0.3.0 .
+k3d image import -c urumi urumi/woo-mcp:0.1.0 urumi/notes-mcp:0.1.0 urumi/everything:2.0.0 urumi/gateway:0.3.0
 ```
 
 The gateway image also contains the built dashboard.
@@ -347,7 +354,7 @@ echo "<token>" | docker login ghcr.io -u kajal-jotwani --password-stdin
 docker buildx build --platform linux/amd64 -f woo-mcp/Dockerfile -t ghcr.io/kajal-jotwani/woo-mcp:0.1.0 --push .
 docker buildx build --platform linux/amd64 -f notes-mcp/Dockerfile -t ghcr.io/kajal-jotwani/notes-mcp:0.1.0 --push .
 docker buildx build --platform linux/amd64 -f everything/Dockerfile -t ghcr.io/kajal-jotwani/everything:2.0.0 --push .
-docker buildx build --platform linux/amd64 -f gateway/Dockerfile -t ghcr.io/kajal-jotwani/gateway:0.2.0 --push .
+docker buildx build --platform linux/amd64 -f gateway/Dockerfile -t ghcr.io/kajal-jotwani/gateway:0.3.0 --push .
 ```
 
 Use `linux/arm64` if the VPS has an ARM processor. On GitHub, open each package's settings and set its visibility to public: the charts use no image pull secret.
@@ -387,6 +394,7 @@ Every upgrade is a change to values or an image tag followed by the same `helm u
 | woo-mcp | `images.wooMcp` in the store chart | Rolling update: the new pod is ready before the old one stops. The gateway reconnects on its next refresh (15 s) | `helm rollback store <revision> -n store` |
 | Gateway and dashboard | `images.gateway` in the gateway chart | Rolling update. Migrations run when the new pod starts | `helm rollback gateway <revision> -n gateway`; migrations only add, so the old image works on the new schema |
 | A provisioned store | Same values as the store chart, applied to that store's release | As for the store | `helm rollback store <revision> -n store-<slug>` |
+| A hosted MCP server | Its image is fixed when it is added: delete it and host it again with the new tag | Its tools are gone until the new one is Running | Host it again with the old tag |
 
 A gateway installed before upstream credentials were encrypted needs the key in its Secret before the upgrade; the new gateway encrypts the stored credentials on its first start. Keep the key: without it the stored credentials cannot be decrypted and must be entered again.
 
@@ -441,6 +449,7 @@ npm run format:check
 |---|---|
 | `charts/store/` | MariaDB, WordPress, setup Job, woo-mcp, their NetworkPolicies |
 | `charts/gateway/` | gateway, PostgreSQL, notes-mcp, server-everything, their NetworkPolicies |
+| `charts/hosted-mcp/` | one hosted MCP server with its Service, NetworkPolicies and quota, installed by the provisioner |
 | `woo-mcp/` | WooCommerce MCP server: five tools over the WooCommerce REST API |
 | `notes-mcp/` | notes MCP server, the third upstream |
 | `everything/` | image for the MCP reference server, the second upstream |

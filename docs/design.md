@@ -14,7 +14,8 @@ Status: approved on 2026-10-23 and implemented. Statements marked **Verified** w
 | PostgreSQL | StatefulSet, PVC, namespace `gateway` | Members, sessions, invites, API keys, upstreams, audit entries, rate-limit counters; carries change announcements between gateway replicas |
 | `server-everything` | Deployment, ClusterIP Service, namespace `gateway` | Second upstream: the official MCP reference server |
 | `notes-mcp` | Deployment, ClusterIP Service, namespace `gateway` | Third upstream, written here: a small notes server that requires a bearer token |
-| Store provisioner | Deployment (1 replica, gateway image), namespace `gateway`, its own service account | Creates and deletes the stores members request on the Stores page: a namespace `store-<slug>` per store with the store chart installed, and its woo-mcp registered as an upstream |
+| Store provisioner | Deployment (1 replica, gateway image), namespace `gateway`, its own service account | Creates and deletes the stores members request on the Stores page: a namespace `store-<slug>` per store with the store chart installed, and its woo-mcp registered as an upstream. Does the same for hosted MCP servers in `mcp-<slug>` |
+| Hosted MCP server | Deployment `server` and ClusterIP Service, namespace `mcp-<slug>` | An image an admin added on the Servers page, registered as an upstream once it runs |
 
 The dashboard (`dashboard/`, React + Vite) is built into the gateway image and served by the gateway from the same origin as `/api` and `/mcp`. One origin means no CORS and one Ingress host.
 
@@ -27,6 +28,7 @@ Stack: TypeScript on Node 24 LTS, Express 5, the MCP TypeScript SDK v2 (`@modelc
 ```
 charts/store/      MariaDB, WordPress, setup Job, woo-mcp
 charts/gateway/    gateway, PostgreSQL, the two extra upstreams
+charts/hosted-mcp/ one hosted MCP server, installed by the provisioner
 woo-mcp/           WooCommerce MCP server
 notes-mcp/         notes MCP server (third upstream)
 everything/        image for the MCP reference server (second upstream)
@@ -37,7 +39,7 @@ docs/              design.md, threat-model.md
 
 `notes-mcp/` and `everything/` are additions to the layout in CLAUDE.md, needed for G6.
 
-Two charts instead of one: the store chart is the unit that the provisioner installs once per store, and the gateway does not need to be reinstalled when a store changes. Each chart has `values.yaml`, `values-local.yaml` and `values-prod.yaml`.
+Two charts instead of one: the store chart is the unit that the provisioner installs once per store, and the gateway does not need to be reinstalled when a store changes. The store and gateway charts each have `values.yaml`, `values-local.yaml` and `values-prod.yaml`. `charts/hosted-mcp` has only `values.yaml`: the provisioner installs it and passes the per-server values, so it has no local or production variant.
 
 ## Decisions
 
