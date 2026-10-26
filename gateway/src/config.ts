@@ -26,6 +26,8 @@ export interface GatewayConfig {
     domain: string;
     maxPerMember: number;
   };
+  /** Tool calls each member may make per minute; 0 turns the limit off. */
+  toolCallsPerMinute: number;
 }
 
 export interface ProvisionerConfig {
@@ -104,6 +106,7 @@ const envSchema = z.object({
   UPSTREAM_CREDENTIAL_KEY: aesKey,
   STORE_DOMAIN: domainName,
   MAX_STORES_PER_MEMBER: z.coerce.number().int().min(0).max(100),
+  TOOL_CALLS_PER_MINUTE: z.coerce.number().int().min(0).max(100_000),
 });
 
 const provisionerEnvSchema = z.object({
@@ -157,6 +160,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): GatewayConfig {
     upstreamNetwork: { internalHosts: vars.UPSTREAM_INTERNAL_HOSTS },
     credentialKey: vars.UPSTREAM_CREDENTIAL_KEY,
     stores: { domain: vars.STORE_DOMAIN, maxPerMember: vars.MAX_STORES_PER_MEMBER },
+    toolCallsPerMinute: vars.TOOL_CALLS_PER_MINUTE,
   };
 }
 

@@ -102,7 +102,10 @@ export async function createMember(
   return member;
 }
 
-/** Creates the first admin when the team has no members yet. Returns whether it did. */
+/**
+ * Creates the first admin when the team has no members yet. Returns whether it did. Replicas that
+ * start together may both try; the email conflict makes the second a no-op.
+ */
 export async function ensureFirstAdmin(
   db: Database,
   admin: { email: string; password: string },
@@ -110,7 +113,8 @@ export async function ensureFirstAdmin(
   const passwordHash = await hashPassword(admin.password);
   const inserted = await db.query(
     `INSERT INTO members (email, name, role, password_hash)
-     SELECT $1, 'Admin', 'admin', $2 WHERE NOT EXISTS (SELECT 1 FROM members) RETURNING id`,
+     SELECT $1, 'Admin', 'admin', $2 WHERE NOT EXISTS (SELECT 1 FROM members)
+     ON CONFLICT (email) DO NOTHING RETURNING id`,
     [normalizeEmail(admin.email), passwordHash],
   );
   return inserted.length > 0;

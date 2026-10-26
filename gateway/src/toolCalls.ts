@@ -5,6 +5,7 @@ import type { AuditEntryInput, Via } from './audit.js';
 import type { Queryable } from './db.js';
 import { recordToolCall } from './metrics.js';
 import { mayCallTool, mayUseTools } from './permissions.js';
+import { countToolCall } from './rateLimit.js';
 import { UpstreamCallError } from './registry.js';
 import type { RoutedTool, UpstreamRegistry } from './registry.js';
 import type { Member } from './team.js';
@@ -27,6 +28,8 @@ export interface ToolCall {
 export interface ToolCallDeps {
   db: Queryable;
   registry: UpstreamRegistry;
+  /** Tool calls each member may make per minute, across all replicas. Unset or 0: no limit. */
+  callsPerMinute?: number;
 }
 
 type Outcome = Pick<AuditEntryInput, 'outcome' | 'reason' | 'upstreamId' | 'upstreamName' | 'tool'> & {
@@ -48,7 +51,8 @@ export async function toolsFor(deps: ToolCallDeps, member: Member): Promise<Rout
 
 /**
  * The one path every tool call takes, from MCP clients and from the chat agent: authorize the member,
- * route the name to its upstream, check the tool's permissions, call it, and write an audit entry whatever happened. Rejections and
+ * apply the rate limit, route the name to its upstream, check the tool's permissions, call it, and
+ * write an audit entry whatever happened. Rejections and
  * upstream failures come back as tool errors, so the model can read them and recover.
  */
 export async function callTool(deps: ToolCallDeps, caller: Caller, call: ToolCall): Promise<CallToolResult> {
@@ -78,7 +82,7 @@ export async function callTool(deps: ToolCallDeps, caller: Caller, call: ToolCal
 }
 
 async function runToolCall(
-  { db, registry }: ToolCallDeps,
+  { db, registry, callsPerMinute }: ToolCallDeps,
   caller: Caller,
   call: ToolCall,
 ): Promise<{ result: CallToolResult; outcome: Outcome }> {
@@ -86,6 +90,14 @@ async function runToolCall(
   if (!mayUseTools(caller.member)) {
     const reason = 'This member may not use tools.';
     return { result: toolError(reason), outcome: { outcome: 'rejected', reason, tool: requestedName } };
+  }
+  if (callsPerMinute) {
+    // Rejected calls count too, so a client retrying in a loop stays limited until the minute ends.
+    const window = await countToolCall(db, caller.member.id);
+    if (window.calls > callsPerMinute) {
+      const reason = `Rate limit reached: ${callsPerMinute} tool calls per minute per member. Try again in ${window.resetInSeconds} s.`;
+      return { result: toolError(reason), outcome: { outcome: 'rejected', reason, tool: requestedName } };
+    }
   }
 
   const tool = registry.resolve(call.name);

@@ -6,8 +6,9 @@ metadata:
   labels:
     {{- include "gateway.labels" $component | nindent 4 }}
 spec:
-  # One replica: upstream status, the tool cache and change notifications live in process memory.
-  replicas: 1
+  # Each replica keeps its own upstream clients and status. Admin changes reach all of them at once
+  # through PostgreSQL LISTEN/NOTIFY, and auth, audit and the rate limit live in PostgreSQL.
+  replicas: {{ .Values.gateway.replicas }}
   selector:
     matchLabels:
       {{- include "gateway.selectorLabels" $component | nindent 6 }}
@@ -58,6 +59,8 @@ spec:
               value: {{ required "Set stores.domain to the domain stores are served under, such as example.com." .Values.stores.domain | quote }}
             - name: MAX_STORES_PER_MEMBER
               value: {{ .Values.stores.maxPerMember | quote }}
+            - name: TOOL_CALLS_PER_MINUTE
+              value: {{ .Values.gateway.toolCallsPerMinute | quote }}
           securityContext:
             {{- include "gateway.restrictedContainer" . | nindent 12 }}
           # The gateway waits up to a minute for PostgreSQL and runs migrations before it listens.

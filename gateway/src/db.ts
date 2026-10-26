@@ -1,4 +1,5 @@
 import { readdir, readFile } from 'node:fs/promises';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 import pg from 'pg';
 
@@ -15,8 +16,15 @@ export interface Transaction extends Queryable {
 export interface Database extends Queryable {
   /** Runs `work` in one transaction, committing when it resolves and rolling back when it throws. */
   transaction<T>(work: (tx: Transaction) => Promise<T>): Promise<T>;
+  /**
+   * Calls onNotification with the payload of every NOTIFY on `channel` until close. Throws when the
+   * first LISTEN fails. A dropped connection is reopened; notifications sent while it is down are lost.
+   */
+  listen(channel: string, onNotification: (payload: string) => void): Promise<void>;
   close(): Promise<void>;
 }
+
+const LISTEN_RETRY_MS = 5000;
 
 export interface PostgresSettings {
   host: string;
@@ -33,6 +41,46 @@ export function createPostgresDatabase(settings: PostgresSettings): Database {
   pool.on('error', (error) => {
     console.error(JSON.stringify({ event: 'database_error', message: error.message }));
   });
+
+  // LISTEN needs a connection of its own for as long as it lasts, so listeners are not pool clients.
+  const listeners = new Set<pg.Client>();
+  let closing = false;
+
+  const subscribe = async (channel: string, onNotification: (payload: string) => void): Promise<void> => {
+    const client = new pg.Client({ ...settings, connectionTimeoutMillis: 5000 });
+    // Without an error listener a lost connection would exit the process. It also emits 'end', below.
+    client.on('error', (error) => {
+      console.error(JSON.stringify({ event: 'database_listen_error', channel, message: error.message }));
+    });
+    client.on('notification', (message) => onNotification(message.payload ?? ''));
+    try {
+      await client.connect();
+      await client.query(`LISTEN ${client.escapeIdentifier(channel)}`);
+    } catch (error) {
+      await client.end().catch(() => undefined);
+      throw error;
+    }
+    listeners.add(client);
+    client.once('end', () => {
+      listeners.delete(client);
+      if (!closing) void resubscribe(channel, onNotification);
+    });
+  };
+  const resubscribe = async (channel: string, onNotification: (payload: string) => void): Promise<void> => {
+    while (!closing) {
+      // Unreferenced, so a pending retry does not keep a stopping process alive.
+      await sleep(LISTEN_RETRY_MS, undefined, { ref: false });
+      if (closing) return;
+      try {
+        await subscribe(channel, onNotification);
+        return;
+      } catch (error) {
+        console.error(
+          JSON.stringify({ event: 'database_listen_failed', channel, message: (error as Error).message }),
+        );
+      }
+    }
+  };
 
   return {
     async query<Row>(sql: string, params?: unknown[]) {
@@ -58,7 +106,12 @@ export function createPostgresDatabase(settings: PostgresSettings): Database {
         client.release();
       }
     },
-    close: () => pool.end(),
+    listen: subscribe,
+    async close() {
+      closing = true;
+      await Promise.all([...listeners].map((client) => client.end()));
+      await pool.end();
+    },
   };
 }
 

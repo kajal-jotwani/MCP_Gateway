@@ -11,6 +11,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 
 import { createApiKey } from '../src/apiKeys.js';
 import { createApp } from '../src/app.js';
+import { followChanges } from '../src/changes.js';
 import type { AuditEntry } from '../src/audit.js';
 import { CHAT_TOOL_LIMIT, chatFailureMessage } from '../src/chat.js';
 import type { ChatEvent } from '../src/chat.js';
@@ -84,6 +85,7 @@ async function startGateway(
   database: Database = db,
   anthropic: Anthropic = unusedAnthropic,
   checkUpstreamUrl: (url: string) => Promise<string | undefined> = allowEveryUrl,
+  toolCallsPerMinute = 0,
 ): Promise<Gateway> {
   const upstream = await startUpstream(['list_orders', 'fail', 'sleep']);
   upstreamCounter += 1;
@@ -93,8 +95,9 @@ async function startGateway(
   )) as [{ id: string }];
   const registry = new UpstreamRegistry({ connectMs: 500, listMs: 500, callMs: 300 });
   await registry.sync((await listUpstreamConfigs(database, cipher)).filter((config) => config.id === id));
-  const mcpHandler = createGatewayMcpHandler({ db: database, registry });
-  const searchMcpHandler = createGatewayMcpHandler({ db: database, registry }, 'search');
+  const toolCallDeps = { db: database, registry, callsPerMinute: toolCallsPerMinute };
+  const mcpHandler = createGatewayMcpHandler(toolCallDeps);
+  const searchMcpHandler = createGatewayMcpHandler(toolCallDeps, 'search');
   const app = createApp({
     db: database,
     registry,
@@ -105,6 +108,8 @@ async function startGateway(
     stores: { domain: 'localtest.me', maxPerMember: 2 },
     cipher,
     checkUpstreamUrl,
+    toolCallsPerMinute,
+    origin: randomUUID(),
     dashboardDir,
   });
   const server: Server = await new Promise((resolve) => {
@@ -522,6 +527,45 @@ describe('MCP endpoint with API keys', () => {
     ]);
     expect(entries[1]?.reason).toBe('Upstream "WooCommerce" did not respond within 0.3 s.');
     expect(entries[1]?.durationMs).toBeGreaterThanOrEqual(300);
+  });
+
+  it('limits tool calls per member per minute across MCP clients and the chat agent, and audits the rejections', async () => {
+    // The limit counts calls in the current clock minute; start early in one so the test stays inside it.
+    if (new Date().getSeconds() >= 55) await new Promise((resolve) => setTimeout(resolve, 6000));
+    const claude = await startFakeClaude([
+      { blocks: [{ type: 'tool_use', name: 'list_orders', input: {} }], stopReason: 'tool_use' },
+      { blocks: [{ type: 'text', text: 'The limit is reached.' }], stopReason: 'end_turn' },
+    ]);
+    const gateway = await startGateway(db, claude.anthropic, allowEveryUrl, 2);
+    const member = await newMember();
+    const client = await mcpClient(gateway, await newKey(db, member));
+    const other = await mcpClient(gateway, await newKey(db, await newMember()));
+
+    expect(text(await client.callTool({ name: 'list_orders', arguments: {} }))).toBe('list_orders done');
+    expect(text(await client.callTool({ name: 'list_orders', arguments: {} }))).toBe('list_orders done');
+    const limited = await client.callTool({ name: 'list_orders', arguments: {} });
+    expect(limited.isError).toBe(true);
+    expect(text(limited)).toMatch(
+      /^Rate limit reached: 2 tool calls per minute per member. Try again in \d+ s\.$/,
+    );
+    const events = await (await new Browser(gateway).login(member.email, PASSWORD)).chat('Any orders?');
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'tool_result',
+        isError: true,
+        preview: expect.stringMatching(/^Rate limit/),
+      }),
+    );
+    expect(text(await other.callTool({ name: 'list_orders', arguments: {} }))).toBe('list_orders done');
+
+    const entries = (await auditEntries(gateway)).filter((entry) => entry.memberId === member.id).reverse();
+    expect(entries.map(({ via, outcome }) => ({ via, outcome }))).toEqual([
+      { via: 'mcp', outcome: 'succeeded' },
+      { via: 'mcp', outcome: 'succeeded' },
+      { via: 'mcp', outcome: 'rejected' },
+      { via: 'chat', outcome: 'rejected' },
+    ]);
+    expect(gateway.upstream.calls).toHaveLength(3);
   });
 
   it('audits calls whose tool name contains a NUL character, with a valid key or without', async () => {
@@ -1292,6 +1336,51 @@ describe('dashboard files', () => {
     const unknownApi = await fetch(`${gateway.url}/api/nothing-here`);
     expect(unknownApi.status).toBe(404);
     expect(await unknownApi.json()).toEqual({ error: 'Not found.' });
+  });
+});
+
+describe('several replicas', () => {
+  it('applies admin changes made on one replica to another at once', async () => {
+    const isolated = await isolatedDatabase();
+    const gateway = await startGateway(isolated);
+    const replica = new UpstreamRegistry({ connectMs: 500, listMs: 500, callMs: 300 });
+    onCleanup(() => replica.close());
+    const loadUpstreams = () => listUpstreamConfigs(isolated, cipher);
+    await followChanges(isolated, replica, loadUpstreams, randomUUID());
+    await replica.reload(loadUpstreams);
+    let listChanged = 0;
+    replica.onToolsChanged(() => (listChanged += 1));
+    expect(replica.listTools().map((tool) => tool.name)).toEqual(['fail', 'list_orders', 'sleep']);
+
+    const admin = await adminBrowser(gateway);
+    const [upstream] = (await admin.request('GET', '/upstreams')).body.upstreams as { id: string }[];
+    await admin.request('PATCH', `/upstreams/${upstream!.id}`, { enabled: false });
+    await eventually(() => expect(replica.states().get(upstream!.id)?.status).toBe('disabled'));
+    expect(replica.listTools()).toEqual([]);
+    expect(listChanged).toBe(1);
+
+    await admin.request('PUT', `/upstreams/${upstream!.id}/access`, { adminOnly: true, adminOnlyTools: [] });
+    await eventually(() => expect(listChanged).toBe(2));
+  });
+
+  it('announces a store the provisioner marks ready to every replica', async () => {
+    const isolated = await isolatedDatabase();
+    const replica = new UpstreamRegistry({ connectMs: 500, listMs: 500, callMs: 300 });
+    onCleanup(() => replica.close());
+    const loadUpstreams = () => listUpstreamConfigs(isolated, cipher);
+    await followChanges(isolated, replica, loadUpstreams, randomUUID());
+    const owner = await newMember('member', isolated);
+    await isolated.query(
+      `INSERT INTO stores (slug, name, url, owner_id, status)
+       VALUES ('north', 'North', 'http://store-north.localtest.me', $1, 'provisioning')`,
+      [owner.id],
+    );
+    const [task] = await listStoreTasks(isolated);
+
+    expect(await markStoreReady(isolated, task!)).toBe(true);
+    await eventually(() =>
+      expect([...replica.states().values()].map((state) => state.slug)).toEqual(['north']),
+    );
   });
 });
 

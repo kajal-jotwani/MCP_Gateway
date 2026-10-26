@@ -7,6 +7,7 @@ import type Anthropic from '@anthropic-ai/sdk';
 import { createApiKey, getApiKey, listApiKeys, revokeApiKey } from './apiKeys.js';
 import { listAuditEntries, upstreamCallStats } from './audit.js';
 import type { UpstreamCallStats } from './audit.js';
+import { announceChange } from './changes.js';
 import { chatFailureMessage, runChatTurn } from './chat.js';
 import type { CredentialCipher } from './credentialCipher.js';
 import type { ChatEvent, ChatTurn } from './chat.js';
@@ -81,6 +82,10 @@ export interface ApiDeps {
   cipher: CredentialCipher;
   /** Why an upstream URL may not be used (server-side request forgery guard), or undefined. */
   checkUpstreamUrl: (url: string) => Promise<string | undefined>;
+  /** Tool calls each member may make per minute; 0: no limit. */
+  toolCallsPerMinute: number;
+  /** This process's name in change announcements to the other replicas. */
+  origin: string;
 }
 
 const SESSION_COOKIE = 'urumi_session';
@@ -333,11 +338,17 @@ export function createApiRouter({
   stores,
   cipher,
   checkUpstreamUrl,
+  toolCallsPerMinute,
+  origin,
 }: ApiDeps): Router {
   const router = express.Router();
   const secureCookie = publicUrl.protocol === 'https:';
 
-  const applyUpstreamChanges = (): Promise<void> => registry.reload(() => listUpstreamConfigs(db, cipher));
+  // Applied here first, so the response shows the new status, then announced to the other replicas.
+  const applyUpstreamChanges = async (): Promise<void> => {
+    await registry.reload(() => listUpstreamConfigs(db, cipher));
+    await announceChange(db, 'upstreams', origin);
+  };
   const assertUsableUrl = async (url: string | undefined): Promise<void> => {
     const refusal = url && (await checkUpstreamUrl(url));
     if (refusal) throw new HttpError(400, `This URL cannot be used: ${refusal}.`);
@@ -529,6 +540,7 @@ export function createApiRouter({
       throw new HttpError(404, 'Not found.');
     // The tool list is per member now, so listening clients list again.
     registry.announceToolsChanged();
+    await announceChange(db, 'access', origin);
     const upstream = (await listUpstreams(db)).find((candidate) => candidate.id === id)!;
     res.json(await upstreamResponse(upstream, admin));
   });
@@ -602,7 +614,13 @@ export function createApiRouter({
     const emit = (event: ChatEvent) => res.write(`${JSON.stringify(event)}\n`);
     const started = Date.now();
     try {
-      await runChatTurn({ db, registry, anthropic }, member, messages, emit, disconnected.signal);
+      await runChatTurn(
+        { db, registry, anthropic, callsPerMinute: toolCallsPerMinute },
+        member,
+        messages,
+        emit,
+        disconnected.signal,
+      );
     } catch (error) {
       if (!disconnected.signal.aborted) {
         console.error(

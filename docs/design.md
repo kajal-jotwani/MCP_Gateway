@@ -10,8 +10,8 @@ Status: approved on 2026-10-23 and implemented. Statements marked **Verified** w
 | WordPress + WooCommerce | Deployment (1 replica), PVC for `wp-content`, namespace `store` | Storefront and wp-admin |
 | Store setup Job | Helm post-install/post-upgrade hook, namespace `store` | Installs WordPress, WooCommerce, COD and the REST key, idempotently |
 | `woo-mcp` | Deployment, ClusterIP Service, namespace `store` | MCP server written here. Five tools over the WooCommerce REST API |
-| `gateway` | Deployment (1 replica), namespace `gateway` | MCP endpoint for clients, MCP client to every upstream, auth, audit, chat agent, dashboard API, serves the built dashboard |
-| PostgreSQL | StatefulSet, PVC, namespace `gateway` | Members, sessions, invites, API keys, upstreams, audit entries |
+| `gateway` | Deployment (2 replicas), namespace `gateway` | MCP endpoint for clients, MCP client to every upstream, auth, audit, chat agent, dashboard API, serves the built dashboard |
+| PostgreSQL | StatefulSet, PVC, namespace `gateway` | Members, sessions, invites, API keys, upstreams, audit entries, rate-limit counters; carries change announcements between gateway replicas |
 | `server-everything` | Deployment, ClusterIP Service, namespace `gateway` | Second upstream: the official MCP reference server |
 | `notes-mcp` | Deployment, ClusterIP Service, namespace `gateway` | Third upstream, written here: a small notes server that requires a bearer token |
 | Store provisioner | Deployment (1 replica, gateway image), namespace `gateway`, its own service account | Creates and deletes the stores members request on the Stores page: a namespace `store-<slug>` per store with the store chart installed, and its woo-mcp registered as an upstream |
@@ -99,7 +99,7 @@ Why operator-created Secrets instead of Helm generating them with `randAlphaNum`
 **Decision: one long-lived client per enabled upstream,** owned by an upstream registry in the gateway process.
 
 - On start, and when an admin adds or enables an upstream or changes its URL or credential, the registry connects (SDK negotiates the protocol era) and lists tools. A name or slug change only recomputes the exposed names.
-- Every 15 s a refresh loop re-reads the upstreams table and lists tools on every enabled upstream in parallel, each with a 5 s timeout (and 5 s to connect). Re-reading the table picks up an admin change handled by another gateway process, such as the old pod during a rolling update. Success sets **Connected** and replaces the cached tool list. Failure sets **Unreachable**, records the reason (timeout, connection refused, HTTP status, protocol error), and drops a broken client so the next refresh reconnects.
+- Every 15 s a refresh loop re-reads the upstreams table and lists tools on every enabled upstream in parallel, each with a 5 s timeout (and 5 s to connect). Re-reading the table is the fallback for an admin change another gateway replica handled while this one missed its announcement (see Scaling). Success sets **Connected** and replaces the cached tool list. Failure sets **Unreachable**, records the reason (timeout, connection refused, HTTP status, protocol error), and drops a broken client so the next refresh reconnects.
 - A tool call that fails at the transport level marks that upstream Unreachable immediately, so the dashboard updates without waiting for the next refresh (D8). A call answered with an HTTP error status, such as 413 for an oversized request, fails on its own and triggers an immediate check instead, so one member's bad request cannot hide a healthy upstream's tools from everyone.
 - **Disabled** comes from the database. A disabled upstream has no client and no tools.
 - If an upstream advertises `tools.listChanged`, the registry also re-lists on that notification. When the upstream ends that stream on purpose, for example because its pod is shutting down, the next refresh opens a new stream on the same client, so calls still running on it are not cut off; an unexpected drop is checked at once.
@@ -286,16 +286,46 @@ W4 is demonstrated in two ways: there is no Ingress or NodePort for woo-mcp, and
 
 ### Is the gateway's MCP endpoint stateful?
 
-The endpoint is stateless. Each POST carries the API key and is authorized on its own. There are no `Mcp-Session-Id` sessions for either protocol era.
+The endpoint is stateless. Each POST carries the API key and is authorized on its own. There are no `Mcp-Session-Id` sessions for either protocol era, so any replica can answer any request and the Service needs no session affinity.
 
-The gateway process does hold state in memory: the upstream clients, the tool cache and status, and the notification bus for `subscriptions/listen`. With two replicas:
+Each gateway process does hold state in memory: the upstream clients, the tool cache and status, and the notification streams of clients connected to it (`subscriptions/listen`). How that works with more than one replica is under Scaling.
 
-- Each replica would run its own refresh loop, so status could briefly differ between replicas and dashboard reads could flip.
-- An admin action handled by replica A would publish `list_changed` only to listeners connected to replica A.
-- Each replica would double the health traffic to upstreams.
-- Each replica applies an admin change at once only when it handles the change itself. The other picks it up on its next refresh, up to 15 s later, and until then keeps listing and calling the old set, so D7 would be up to 15 s late on that replica.
+### Scaling: several gateway replicas
 
-Auth and audit would still be correct, because they read and write PostgreSQL on every request. The chart runs one replica; during a rolling update the old and new pods overlap for a few seconds, which the periodic re-read covers. Fixing the above would mean `LISTEN/NOTIFY` for admin changes and storing status in PostgreSQL; that is the scaling extension and out of scope.
+The chart runs two replicas (`gateway.replicas`). What each piece of state needs:
+
+| State | Where it lives | With several replicas |
+|---|---|---|
+| Members, sessions, API keys, audit, tool permissions | PostgreSQL, read on every request | Correct on every replica: a revoked key or a new permission applies to the next request wherever it lands |
+| Upstream list (added, edited, disabled, removed) | PostgreSQL; each replica keeps its own clients | The replica that handles the change applies it at once, then announces it with `NOTIFY gateway_changes`. Every other replica `LISTEN`s and reloads at once, so D7 holds on all of them and each tells its own listening clients `list_changed`. The provisioner announces a store it marks ready the same way |
+| Tool permissions changes | PostgreSQL | Announced the same way, so every replica sends `list_changed` to its listeners |
+| Upstream status and tool cache | Each replica's memory | Each replica checks every upstream on its own 15 s loop. Status can differ between replicas for up to one refresh after an upstream goes down or comes back, so a dashboard reload can briefly show either. A dead upstream is still seen as Unreachable by both within 15 s (D8) |
+| Rate-limit counters | PostgreSQL | One counter per member per minute, shared by all replicas |
+
+Options considered for keeping replicas in step:
+
+| Option | For | Against |
+|---|---|---|
+| Periodic re-read only (what one replica already did) | No new mechanism | Up to 15 s during which a disabled server's tools are still listed and callable on the other replica |
+| PostgreSQL `LISTEN/NOTIFY` | Already deployed; a notification inside a transaction is sent on commit, never for a rolled-back change | One extra database connection per replica; notifications sent while that connection is down are lost |
+| Redis or another bus | Familiar pattern | One more stateful workload for two message types |
+| Status in PostgreSQL, written by one leader | One status for everyone | Leader election, and status writes every 15 s per upstream |
+
+**Decision: `LISTEN/NOTIFY` plus the periodic re-read.** The payload is the kind of change and the sender's id, so a replica skips its own announcements. The listening connection reconnects after 5 s when it drops, and the 15 s re-read covers anything announced in between. Status stays per replica: it is a health observation, and each replica routes calls on what it observes itself.
+
+Costs that stay: each replica keeps its own connections to every upstream and runs its own health checks, so health traffic grows with the replica count. Each replica opens up to 10 pooled connections plus one for `LISTEN`; PostgreSQL's default limit of 100 leaves room for several. Migrations and first-start seeding take an advisory lock or use `ON CONFLICT`, so replicas that start together do not race.
+
+### Rate limit
+
+Each member may make `gateway.toolCallsPerMinute` tool calls per clock minute (120 by default; 0 turns the limit off), from MCP clients and the chat agent together. The check is in the single call path, after the member check and before routing, so it covers `/mcp`, `/mcp/search` (`call_tool`) and chat. A call over the limit is rejected as a tool error, "Rate limit reached: 120 tool calls per minute per member. Try again in 23 s.", and audited as `rejected`.
+
+| Option | For | Against |
+|---|---|---|
+| Counter per replica in memory | No database work | The limit multiplies by the replica count |
+| Count audit entries from the last minute | No new table | Entries are written when a call ends, so many calls started together all pass |
+| Counter row per member per minute in PostgreSQL | One atomic upsert per call, exact across replicas | A write per call |
+
+**Decision: a counter row in PostgreSQL** (`tool_call_windows`). One statement increments the current minute's row and deletes the member's older ones, so a member has at most one row. Rejected calls count too, so a client that retries in a loop stays limited until the minute ends. A fixed window lets a member make up to twice the limit across a minute boundary; that is accepted for a guard against runaway clients. The limit is per member rather than per key, so creating more keys does not raise it.
 
 ### Server-side request forgery guard
 
@@ -411,7 +441,7 @@ External client `tools/call`:
 
 1. Client POSTs to `https://app.<domain>/mcp` with `Authorization: Bearer urk_...`.
 2. Gateway hashes the key and loads the member. Missing, unknown or revoked key, or a deactivated member's key: HTTP 401 and an audit entry `rejected` with the key's display prefix. A revoked key or a deactivated member's key matches a stored hash, so the entry is attributed to that member; an unknown key has no member.
-3. `callTool` (`gateway/src/toolCalls.ts`) checks `mayUseTools(member)`, then `registry.resolve` maps `list_orders` to the WooCommerce upstream and its original tool name.
+3. `callTool` (`gateway/src/toolCalls.ts`) checks `mayUseTools(member)` and the rate limit, then `registry.resolve` maps `list_orders` to the WooCommerce upstream and its original tool name.
 4. The registry's client for that upstream calls `list_orders` with the upstream's static credential, if any. The client's API key is not forwarded.
 5. woo-mcp signs a REST request to WordPress, trims the response and returns it.
 6. Gateway returns the upstream's content, structured content and error flag (the result's own `_meta` is dropped), refusing results over 1 MB, and writes the audit entry (`succeeded`, duration).
@@ -429,6 +459,7 @@ upstreams      id, slug (unique), name, url, auth_type (none|bearer|header), aut
 admin_only_tools  upstream_id (deleted with its upstream), tool (the upstream's tool name)
 stores         id, slug (unique, DNS label), name, url, owner_id, status (provisioning|ready|failed|deleting), reason, attempt, attempt_started_at, created_at, updated_at
 bootstrap      action, done_at
+tool_call_windows  member_id, window_start (a minute), calls
 audit_entries  id, at, member_id (nullable), key_prefix (nullable), via (mcp|chat), upstream_id (nullable, no foreign key), upstream_name, tool, duration_ms, outcome (succeeded|failed|timed_out|rejected), reason
 ```
 
@@ -488,6 +519,8 @@ Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and ever
 | Many tools | `/mcp/search` with `search_tools` and `call_tool`; chat switches above 40 tools |
 | Tool permissions | `upstreams.admin_only` and `admin_only_tools`; `mayCallTool` in listing (`toolsFor`) and in the single call path |
 | Observability | Failure reasons from the error cause chain; per-server stats from `audit_entries`; Prometheus `/metrics` on port 9464 |
+| Scaling | Two replicas; PostgreSQL `LISTEN/NOTIFY` on `gateway_changes` for admin and provisioner changes; stateless MCP endpoint |
+| Rate limit | `tool_call_windows` counter per member per minute, checked in the single call path |
 | Multi-store bonus | `stores` table and Stores page; provisioner running Helm per namespace `store-<slug>`; RBAC bound per store namespace plus an admission policy; quota, LimitRange, per-member limit and timeout; woo-mcp egress policy; store tools always `<slug>__<tool>` |
 
 ## Production changes

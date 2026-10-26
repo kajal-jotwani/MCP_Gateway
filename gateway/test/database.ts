@@ -22,6 +22,9 @@ export async function createTestDatabase(): Promise<Database> {
           },
         }),
       ),
+    async listen(channel: string, onNotification: (payload: string) => void) {
+      await pglite.listen(channel, onNotification);
+    },
     close: () => pglite.close(),
   };
   await migrate(db);

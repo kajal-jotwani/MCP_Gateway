@@ -1,9 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import Anthropic from '@anthropic-ai/sdk';
 
 import { createApp } from './app.js';
+import { followChanges } from './changes.js';
 import { loadConfig } from './config.js';
 import { createCredentialCipher, CredentialDecryptError } from './credentialCipher.js';
 import type { GatewayConfig } from './config.js';
@@ -58,8 +60,10 @@ if (await seedUpstreamOnce(db, config.seedUpstream)) {
 }
 
 const registry = new UpstreamRegistry(TIMEOUTS, createGuardedFetch(config.upstreamNetwork));
-const mcpHandler = createGatewayMcpHandler({ db, registry });
-const searchMcpHandler = createGatewayMcpHandler({ db, registry }, 'search');
+const toolCallDeps = { db, registry, callsPerMinute: config.toolCallsPerMinute };
+const mcpHandler = createGatewayMcpHandler(toolCallDeps);
+const searchMcpHandler = createGatewayMcpHandler(toolCallDeps, 'search');
+const origin = randomUUID();
 const app = createApp({
   db,
   registry,
@@ -70,6 +74,8 @@ const app = createApp({
   stores: config.stores,
   cipher,
   checkUpstreamUrl: (url) => upstreamUrlRefusal(url, config.upstreamNetwork),
+  toolCallsPerMinute: config.toolCallsPerMinute,
+  origin,
   dashboardDir: DASHBOARD_DIR,
 });
 const server = app.listen(config.port, () => {
@@ -79,10 +85,12 @@ reportUpstreamStates(() => registry.states().values());
 const metricsServer = startMetricsServer(config.metricsPort);
 
 const loadUpstreams = () => listUpstreamConfigs(db, cipher);
+// Listening starts before the first load, so a change made in between is not missed.
+await followChanges(db, registry, loadUpstreams, origin);
 // Connecting to upstreams happens after the server is up, so readiness never waits on an upstream.
 await registry.reload(loadUpstreams);
-// Each refresh also re-reads the upstreams table, because during a rolling update the old pod may
-// handle an admin change that this process would otherwise never see.
+// Each refresh also re-reads the upstreams table, in case a change announcement was missed while
+// the listening connection was down.
 const refreshTimer = setInterval(() => {
   void registry
     .reload(loadUpstreams)

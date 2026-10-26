@@ -1,3 +1,4 @@
+import { announceChange } from './changes.js';
 import type { Database, Queryable } from './db.js';
 
 export type StoreStatus = 'provisioning' | 'ready' | 'failed' | 'deleting';
@@ -158,6 +159,8 @@ export async function markStoreReady(db: Database, task: StoreTask): Promise<boo
     await tx.query(`UPDATE stores SET status = 'ready', reason = NULL, updated_at = now() WHERE id = $1`, [
       task.id,
     ]);
+    // Sent on commit, so every gateway replica connects to the store's woo-mcp at once.
+    await announceChange(tx, 'upstreams', 'provisioner');
     return true;
   });
 }

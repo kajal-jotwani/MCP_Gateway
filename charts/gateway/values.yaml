@@ -17,6 +17,13 @@ seedUpstream:
   slug: woocommerce
   url: http://woo-mcp.store.svc.cluster.local:3000/mcp
 
+gateway:
+  # Gateway pods behind the Service. Any number works; see "Scaling" in docs/design.md.
+  replicas: 2
+  # Tool calls each member may make per minute, counted across all replicas, from MCP clients and the
+  # chat agent together. 0 turns the limit off.
+  toolCallsPerMinute: 120
+
 # Stores members create from the dashboard. The provisioner installs ../store into a namespace
 # store-<slug> per store and registers its woo-mcp as an upstream.
 stores:

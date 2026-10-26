@@ -219,7 +219,16 @@ kubectl -n gateway port-forward deploy/gateway 9464 &
 curl -s localhost:9464/metrics | grep '^gateway_'
 ```
 
-To let a Prometheus in another namespace scrape the pods, set `metrics.scrapeNamespace` to that namespace.
+The port-forward reaches one of the gateway pods, and each pod counts only the calls it served. To let a Prometheus in another namespace scrape every pod, set `metrics.scrapeNamespace` to that namespace.
+
+### Rate limit and replicas
+
+Each member may make 120 tool calls a minute (`gateway.toolCallsPerMinute`), from MCP clients and the chat together; further calls are rejected with the time to wait and show as `rejected` in the audit log. The gateway runs two replicas (`gateway.replicas`). An admin change made through either one reaches the other at once, so a disabled server's tools disappear from clients on both:
+
+```sh
+kubectl -n gateway get pods -l app.kubernetes.io/name=gateway   # two gateway pods
+kubectl -n gateway delete pod <one-of-them>                    # the dashboard and /mcp keep working
+```
 
 ### Show a name collision
 

@@ -17,6 +17,7 @@ const validEnv = {
   UPSTREAM_CREDENTIAL_KEY: Buffer.alloc(32, 7).toString('base64'),
   STORE_DOMAIN: 'localtest.me',
   MAX_STORES_PER_MEMBER: '3',
+  TOOL_CALLS_PER_MINUTE: '120',
 };
 
 describe('loadConfig', () => {
