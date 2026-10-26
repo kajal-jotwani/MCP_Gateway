@@ -92,7 +92,7 @@ unset ANTHROPIC_API_KEY
 | Secret | Keys | Used by |
 |---|---|---|
 | `store-credentials` | MariaDB passwords, WordPress admin password and salts, the WooCommerce REST key and secret for woo-mcp | MariaDB, WordPress, setup Job, woo-mcp |
-| `gateway-credentials` | PostgreSQL password, first admin's email and password, `UPSTREAM_CREDENTIAL_KEY` (the AES-256 key upstream credentials are encrypted with in PostgreSQL) | PostgreSQL, gateway |
+| `gateway-credentials` | PostgreSQL password, first admin's email and password, `UPSTREAM_CREDENTIAL_KEY` (the AES-256 key upstream credentials and hosted servers' environments are encrypted with in PostgreSQL) | PostgreSQL, gateway, provisioner |
 | `notes-credentials` | `NOTES_TOKEN`, the bearer token notes-mcp requires | notes-mcp; an admin enters the same value in the dashboard |
 | `llm-credentials` | `ANTHROPIC_API_KEY` | the chat agent |
 
