@@ -314,9 +314,33 @@ The charts serve plain HTTP. On a public VPS, passwords and API keys then cross 
 
 ## Upgrades, rollback and backups
 
-- Upgrade by changing values or image tags and running the same `helm upgrade --install` command. `--rollback-on-failure` returns to the previous revision if the new pods do not become ready.
-- Roll back by hand with `helm history <release> -n <namespace>` and `helm rollback <release> <revision> -n <namespace>`.
+Every upgrade is a change to values or an image tag followed by the same `helm upgrade --install` command used to install. `--rollback-on-failure` returns the release to its previous revision if the new pods do not become ready, and the old pods keep serving until the new ones are ready (except WordPress, below).
+
+| Component | What to change | How it rolls out | Rolling back |
+|---|---|---|---|
+| WordPress | `images.wordpress` in the store chart | `Recreate`, because `wp-content` is ReadWriteOnce: the storefront is down for the restart, about 30 s | `helm rollback store <revision> -n store` |
+| WooCommerce | `woocommerceVersion` in the store chart | The setup Job installs the version after the upgrade and WooCommerce migrates its tables | Not undone by `helm rollback`; see below |
+| woo-mcp | `images.wooMcp` in the store chart | Rolling update: the new pod is ready before the old one stops. The gateway reconnects on its next refresh (15 s) | `helm rollback store <revision> -n store` |
+| Gateway and dashboard | `images.gateway` in the gateway chart | Rolling update. Migrations run when the new pod starts | `helm rollback gateway <revision> -n gateway`; migrations only add, so the old image works on the new schema |
+| A provisioned store | Same values as the store chart, applied to that store's release | As for the store | `helm rollback store <revision> -n store-<slug>` |
+
+Upgrade the store before the gateway when a release changes both, so the gateway never calls tools that the running woo-mcp does not have yet.
+
+The provisioner installs a provisioned store once and does not upgrade it afterwards. To upgrade one, run Helm against its namespace from the repository. `--reuse-values` keeps the values the provisioner gave it (URL, title, gateway namespace):
+
+```sh
+helm upgrade store charts/store -n store-<slug> --reuse-values --set images.wooMcp=urumi/woo-mcp:<new-tag> --rollback-on-failure --timeout 10m
+```
+
+To roll back by hand, find the revision and roll back to it:
+
+```sh
+helm history gateway -n gateway
+helm rollback gateway <revision> -n gateway --wait --timeout 5m
+```
+
 - The MariaDB, PostgreSQL and `wp-content` volumes survive `helm uninstall` and failed upgrades.
+- Change the MariaDB and PostgreSQL images only within a major version. A new major version cannot read the old data files; it needs a dump from the old version restored into a new volume.
 - Before changing the WooCommerce version, back up the store database; WooCommerce's own schema changes cannot be rolled back by Helm:
 
   ```sh
