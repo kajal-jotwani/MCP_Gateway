@@ -27,6 +27,17 @@ export interface ApiKey {
   lastUsedAt: string | null;
 }
 
+/** An app a member allowed through OAuth. `label` is what the audit log shows for its calls. */
+export interface OAuthGrant {
+  id: string;
+  memberId: string;
+  clientName: string;
+  label: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+}
+
 export type AuthType = 'none' | 'bearer' | 'header';
 export type UpstreamStatus = 'connected' | 'unreachable' | 'disabled';
 

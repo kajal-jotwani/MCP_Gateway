@@ -180,6 +180,12 @@ With many servers, point the client at `http://app.localtest.me/mcp/search` inst
 
 A revoked key gets HTTP 401 on its next request. MCP Inspector then reports `auth_required`, because it reads the 401 as a request to sign in with OAuth.
 
+#### Connect with OAuth instead of a key
+
+Clients that support MCP's OAuth sign-in need only the URL, for example `claude mcp add --transport http team-gateway https://app.example.com/mcp`. The client registers itself, opens `/oauth/authorize` in the browser, and the member signs in to the dashboard and clicks **Allow**. The app then appears under **Your connected apps** on the API keys page, where it can be revoked; its calls show in the audit log as `OAuth app oauth:<id>`.
+
+OAuth needs HTTPS, except on `localhost`. The local setup serves `http://app.localtest.me`, so most clients refuse to sign in there and an API key is the way to connect locally. The automated tests run the whole flow (`npm test -- -t OAuth`).
+
 ### Use the chat agent
 
 Open **Chat** and ask, for example:

@@ -1,12 +1,19 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import type { Server } from 'node:http';
+import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import Anthropic from '@anthropic-ai/sdk';
-import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import { Client, StreamableHTTPClientTransport, UnauthorizedError } from '@modelcontextprotocol/client';
+import type {
+  OAuthClientMetadata,
+  OAuthClientProvider,
+  OAuthDiscoveryState,
+  StoredOAuthClientInformation,
+  StoredOAuthTokens,
+} from '@modelcontextprotocol/client';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { createApiKey } from '../src/apiKeys.js';
@@ -85,7 +92,8 @@ async function startGateway(
   database: Database = db,
   anthropic: Anthropic = unusedAnthropic,
   checkUpstreamUrl: (url: string) => Promise<string | undefined> = allowEveryUrl,
-  toolCallsPerMinute = 0,
+  // ownPublicUrl: the gateway's public URL is its own loopback address, as OAuth clients need.
+  { toolCallsPerMinute = 0, ownPublicUrl = false } = {},
 ): Promise<Gateway> {
   const upstream = await startUpstream(['list_orders', 'fail', 'sleep']);
   upstreamCounter += 1;
@@ -98,13 +106,16 @@ async function startGateway(
   const toolCallDeps = { db: database, registry, callsPerMinute: toolCallsPerMinute };
   const mcpHandler = createGatewayMcpHandler(toolCallDeps);
   const searchMcpHandler = createGatewayMcpHandler(toolCallDeps, 'search');
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const app = createApp({
     db: database,
     registry,
     mcpHandler,
     searchMcpHandler,
     anthropic,
-    publicUrl: new URL('http://app.localtest.me'),
+    publicUrl: new URL(ownPublicUrl ? url : 'http://app.localtest.me'),
     stores: { domain: 'localtest.me', maxPerMember: 2 },
     cipher,
     checkUpstreamUrl,
@@ -112,9 +123,7 @@ async function startGateway(
     origin: randomUUID(),
     dashboardDir,
   });
-  const server: Server = await new Promise((resolve) => {
-    const listening = app.listen(0, '127.0.0.1', () => resolve(listening));
-  });
+  server.on('request', app);
   onCleanup(async () => {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
@@ -122,7 +131,7 @@ async function startGateway(
     await searchMcpHandler.close();
     await registry.close();
   });
-  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, upstream };
+  return { url, upstream };
 }
 
 /** A browser with a cookie jar that talks to /api the way the dashboard does. */
@@ -536,7 +545,7 @@ describe('MCP endpoint with API keys', () => {
       { blocks: [{ type: 'tool_use', name: 'list_orders', input: {} }], stopReason: 'tool_use' },
       { blocks: [{ type: 'text', text: 'The limit is reached.' }], stopReason: 'end_turn' },
     ]);
-    const gateway = await startGateway(db, claude.anthropic, allowEveryUrl, 2);
+    const gateway = await startGateway(db, claude.anthropic, allowEveryUrl, { toolCallsPerMinute: 2 });
     const member = await newMember();
     const client = await mcpClient(gateway, await newKey(db, member));
     const other = await mcpClient(gateway, await newKey(db, await newMember()));
@@ -1336,6 +1345,223 @@ describe('dashboard files', () => {
     const unknownApi = await fetch(`${gateway.url}/api/nothing-here`);
     expect(unknownApi.status).toBe(404);
     expect(await unknownApi.json()).toEqual({ error: 'Not found.' });
+  });
+});
+
+/** An MCP client's OAuth state, kept in memory. The browser step is done by the test. */
+class TestOAuthApp implements OAuthClientProvider {
+  authorizationUrl?: URL;
+  readonly redirectUrl = 'http://127.0.0.1:53682/callback';
+  private information?: StoredOAuthClientInformation;
+  private stored?: StoredOAuthTokens;
+  private verifier = '';
+  private discovery?: OAuthDiscoveryState;
+
+  get clientMetadata(): OAuthClientMetadata {
+    return { client_name: 'Test app', redirect_uris: [this.redirectUrl] };
+  }
+  clientInformation() {
+    return this.information;
+  }
+  saveClientInformation(information: StoredOAuthClientInformation) {
+    this.information = information;
+  }
+  tokens() {
+    return this.stored;
+  }
+  saveTokens(tokens: StoredOAuthTokens) {
+    this.stored = tokens;
+  }
+  redirectToAuthorization(url: URL) {
+    this.authorizationUrl = url;
+  }
+  saveCodeVerifier(verifier: string) {
+    this.verifier = verifier;
+  }
+  codeVerifier() {
+    return this.verifier;
+  }
+  saveDiscoveryState(state: OAuthDiscoveryState) {
+    this.discovery = state;
+  }
+  discoveryState() {
+    return this.discovery;
+  }
+}
+
+async function postForm(gateway: Gateway, path: string, form: Record<string, string>) {
+  const response = await fetch(`${gateway.url}${path}`, { method: 'POST', body: new URLSearchParams(form) });
+  return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+}
+
+async function postJson(gateway: Gateway, path: string, body: unknown) {
+  const response = await fetch(`${gateway.url}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+}
+
+describe('OAuth', () => {
+  it('signs an MCP client in through the dashboard, calls tools as the member, refreshes, and refuses it once revoked', async () => {
+    const gateway = await startGateway(db, unusedAnthropic, allowEveryUrl, { ownPublicUrl: true });
+    const member = await newMember();
+    const app = new TestOAuthApp();
+    const endpoint = new URL(`${gateway.url}/mcp`);
+
+    // Discovery from the 401, registration and the redirect to the dashboard all happen in the SDK.
+    const unauthorized = new Client({ name: 'test-client', version: '1.0.0' });
+    await expect(
+      unauthorized.connect(new StreamableHTTPClientTransport(endpoint, { authProvider: app })),
+    ).rejects.toThrow(UnauthorizedError);
+    const authorizationUrl = app.authorizationUrl!;
+    expect(authorizationUrl.origin + authorizationUrl.pathname).toBe(`${gateway.url}/oauth/authorize`);
+    expect(authorizationUrl.searchParams.get('resource')).toBe(`${gateway.url}/mcp`);
+
+    const browser = await new Browser(gateway).login(member.email, PASSWORD);
+    const shown = await browser.request('GET', `/oauth/authorization${authorizationUrl.search}`);
+    expect(shown.body).toEqual({ clientName: 'Test app', redirectTo: '127.0.0.1:53682' });
+    const decision = await browser.request('POST', '/oauth/authorization', {
+      search: authorizationUrl.search,
+      approve: true,
+    });
+    const callback = new URL(decision.body.redirectUrl as string);
+    expect(callback.origin + callback.pathname).toBe(app.redirectUrl);
+    expect(callback.searchParams.get('iss')).toBe(gateway.url);
+    const code = callback.searchParams.get('code')!;
+
+    const transport = new StreamableHTTPClientTransport(endpoint, { authProvider: app });
+    await transport.finishAuth(code, callback.searchParams.get('iss')!);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(transport);
+    onCleanup(() => client.close());
+    expect(text(await client.callTool({ name: 'list_orders', arguments: {} }))).toBe('list_orders done');
+    const [entry] = (await auditEntries(gateway)).filter((e) => e.memberId === member.id);
+    expect(entry).toMatchObject({ via: 'mcp', tool: 'list_orders', outcome: 'succeeded' });
+    expect(entry!.keyPrefix).toMatch(/^oauth:[0-9a-f]{8}$/);
+    expect(gateway.upstream.calls.at(-1)?.authorization).toBeUndefined();
+
+    const clientId = app.clientInformation()!.client_id;
+    const reused = await postForm(gateway, '/oauth/token', {
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: app.redirectUrl,
+      client_id: clientId,
+      code_verifier: app.codeVerifier(),
+    });
+    expect(reused).toMatchObject({ status: 400, body: { error: 'invalid_grant' } });
+
+    const before = app.tokens()!;
+    const refreshed = await postForm(gateway, '/oauth/token', {
+      grant_type: 'refresh_token',
+      refresh_token: before.refresh_token!,
+      client_id: clientId,
+    });
+    expect(refreshed.status).toBe(200);
+    const callWith = (token: string) =>
+      fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${token}`,
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          'mcp-protocol-version': '2025-11-25',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: { name: 'list_orders' },
+        }),
+      });
+    expect((await callWith(before.access_token)).status).toBe(401);
+    expect((await callWith(refreshed.body.access_token as string)).status).toBe(200);
+    const replayed = await postForm(gateway, '/oauth/token', {
+      grant_type: 'refresh_token',
+      refresh_token: before.refresh_token!,
+      client_id: clientId,
+    });
+    expect(replayed).toMatchObject({ status: 400, body: { error: 'invalid_grant' } });
+
+    const { body } = await browser.request('GET', '/oauth/grants');
+    const [grant] = body.grants as { id: string; clientName: string; label: string }[];
+    expect(grant).toMatchObject({ clientName: 'Test app', label: entry!.keyPrefix });
+    await browser.request('DELETE', `/oauth/grants/${grant!.id}`);
+    const revoked = await callWith(refreshed.body.access_token as string);
+    expect(revoked.status).toBe(401);
+    expect(revoked.headers.get('www-authenticate')).toBe(
+      `Bearer error="invalid_token", resource_metadata="${gateway.url}/.well-known/oauth-protected-resource/mcp"`,
+    );
+    const [rejection] = (await auditEntries(gateway)).filter((e) => e.memberId === member.id);
+    expect(rejection).toMatchObject({
+      outcome: 'rejected',
+      tool: 'list_orders',
+      keyPrefix: grant!.label,
+      reason: 'OAuth token of a revoked app (tools/call).',
+    });
+  });
+
+  it('refuses unsafe redirect URIs and sends other authorization errors back to the app', async () => {
+    const gateway = await startGateway(db, unusedAnthropic, allowEveryUrl, { ownPublicUrl: true });
+    const metadata = (await (
+      await fetch(`${gateway.url}/.well-known/oauth-authorization-server`)
+    ).json()) as {
+      code_challenge_methods_supported: string[];
+    };
+    expect(metadata).toMatchObject({ issuer: gateway.url, code_challenge_methods_supported: ['S256'] });
+
+    for (const uri of ['http://evil.example/callback', 'javascript:alert(1)', 'https://app.example/cb#x']) {
+      const refused = await postJson(gateway, '/oauth/register', { redirect_uris: [uri] });
+      expect(refused).toMatchObject({ status: 400, body: { error: 'invalid_redirect_uri' } });
+    }
+    const registered = await postJson(gateway, '/oauth/register', {
+      client_name: 'Web app',
+      redirect_uris: ['https://app.example/cb'],
+      token_endpoint_auth_method: 'client_secret_basic',
+    });
+    expect(registered).toMatchObject({ status: 201, body: { token_endpoint_auth_method: 'none' } });
+    const clientId = registered.body.client_id as string;
+
+    const browser = await new Browser(gateway).login(ADMIN.email, ADMIN.password);
+    const authorize = (params: Record<string, string>) =>
+      browser.request('GET', `/oauth/authorization?${new URLSearchParams(params)}`);
+    const valid = {
+      client_id: clientId,
+      redirect_uri: 'https://app.example/cb',
+      response_type: 'code',
+      code_challenge: 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM',
+      code_challenge_method: 'S256',
+      state: 'xyz',
+    };
+    expect(await authorize({ ...valid, redirect_uri: 'https://other.example/cb' })).toMatchObject({
+      status: 400,
+      body: { error: 'This app asked to return to an address it did not register.' },
+    });
+    const errorOf = async (params: Record<string, string>) => {
+      const { body } = await authorize(params);
+      const url = new URL(body.redirectUrl as string);
+      return [url.origin + url.pathname, url.searchParams.get('error'), url.searchParams.get('state')];
+    };
+    expect(await errorOf({ ...valid, code_challenge_method: 'plain' })).toEqual([
+      'https://app.example/cb',
+      'invalid_request',
+      'xyz',
+    ]);
+    expect(await errorOf({ ...valid, resource: 'https://elsewhere.example/mcp' })).toEqual([
+      'https://app.example/cb',
+      'invalid_target',
+      'xyz',
+    ]);
+    const denied = await browser.request('POST', '/oauth/authorization', {
+      search: `?${new URLSearchParams(valid)}`,
+      approve: false,
+    });
+    expect(new URL(denied.body.redirectUrl as string).searchParams.get('error')).toBe('access_denied');
+    expect(
+      (await new Browser(gateway).request('GET', `/oauth/authorization?${new URLSearchParams(valid)}`))
+        .status,
+    ).toBe(401);
   });
 });
 

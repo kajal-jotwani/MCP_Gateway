@@ -13,6 +13,15 @@ import type { CredentialCipher } from './credentialCipher.js';
 import type { ChatEvent, ChatTurn } from './chat.js';
 import type { Database } from './db.js';
 import {
+  approveAuthorization,
+  checkAuthorizationRequest,
+  deniedRedirect,
+  getOAuthGrant,
+  listOAuthGrants,
+  oauthIssuerFor,
+  revokeOAuthGrant,
+} from './oauth.js';
+import {
   auditScopeOf,
   isAdmin,
   mayCallTool,
@@ -111,6 +120,7 @@ const memberPatchBody = z
   .refine((change) => change.role !== undefined || change.active !== undefined, 'nothing to change');
 const keyBody = z.object({ name: z.string().trim().min(1).max(100), memberId: idSchema.optional() });
 const keyListQuery = z.object({ memberId: z.union([idSchema, z.literal('all')]).optional() });
+const authorizationDecisionBody = z.object({ search: z.string().max(10_000), approve: z.boolean() });
 const auditQuery = z.object({
   before: z
     .string()
@@ -343,6 +353,7 @@ export function createApiRouter({
 }: ApiDeps): Router {
   const router = express.Router();
   const secureCookie = publicUrl.protocol === 'https:';
+  const issuer = oauthIssuerFor(publicUrl);
 
   // Applied here first, so the response shows the new status, then announced to the other replicas.
   const applyUpstreamChanges = async (): Promise<void> => {
@@ -482,6 +493,49 @@ export function createApiRouter({
     if (!mayManageKeysOf(actor, apiKey.memberId))
       throw new HttpError(403, 'You can only revoke your own keys.');
     res.json({ apiKey: await revokeApiKey(db, apiKey.id) });
+  });
+
+  // The consent step of the OAuth flow: the dashboard's /oauth/authorize page shows the app and sends
+  // the member's decision, so approval needs the dashboard session like any other change.
+  router.get('/oauth/authorization', async (req, res) => {
+    signedInMember(res);
+    const search = new URL(req.originalUrl, 'http://gateway').search;
+    const check = await checkAuthorizationRequest(db, issuer, new URLSearchParams(search));
+    if (check.outcome === 'refused') throw new HttpError(400, check.message);
+    if (check.outcome === 'redirect') return res.json({ redirectUrl: check.redirectUrl });
+    const { client, redirectUri } = check.request;
+    res.json({ clientName: client.name, redirectTo: new URL(redirectUri).host || redirectUri });
+  });
+
+  router.post('/oauth/authorization', async (req, res) => {
+    const member = signedInMember(res);
+    const { search, approve } = parse(authorizationDecisionBody, req.body);
+    const check = await checkAuthorizationRequest(db, issuer, new URLSearchParams(search));
+    if (check.outcome === 'refused') throw new HttpError(400, check.message);
+    if (check.outcome === 'redirect') return res.json({ redirectUrl: check.redirectUrl });
+    res.json({
+      redirectUrl: approve
+        ? await approveAuthorization(db, issuer, check.request, member.id)
+        : deniedRedirect(issuer, check.request),
+    });
+  });
+
+  router.get('/oauth/grants', async (req, res) => {
+    const actor = signedInMember(res);
+    const { memberId = actor.id } = parse(keyListQuery, req.query);
+    if (memberId === 'all' ? !isAdmin(actor) : !mayManageKeysOf(actor, memberId)) {
+      throw new HttpError(403, 'You can only see your own connected apps.');
+    }
+    res.json({ grants: await listOAuthGrants(db, memberId === 'all' ? undefined : memberId) });
+  });
+
+  router.delete('/oauth/grants/:id', async (req, res) => {
+    const actor = signedInMember(res);
+    const grant = await getOAuthGrant(db, parseId(req.params.id));
+    if (!grant) throw new HttpError(404, 'Not found.');
+    if (!mayManageKeysOf(actor, grant.memberId))
+      throw new HttpError(403, 'You can only revoke your own connected apps.');
+    res.json({ grant: await revokeOAuthGrant(db, grant.id) });
   });
 
   router.get('/audit', async (req, res) => {

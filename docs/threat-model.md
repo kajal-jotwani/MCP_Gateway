@@ -7,7 +7,7 @@ The gateway sits between team members and MCP servers that hold the team's data 
 | Party | Trusted with | Not trusted with |
 |---|---|---|
 | Admin | Adding, editing and removing upstreams and their credentials; members, invites and everyone's keys; the whole audit log | Nothing beyond the dashboard: no cluster access is implied |
-| Member | Calling every tool of every enabled upstream, with its own API key or through the chat agent; creating up to 3 stores and deleting their own | Upstream URLs and credentials, other members' keys, other members' audit entries, other members' stores |
+| Member | Calling every tool of every enabled upstream, with its own API key, an OAuth app it allowed, or through the chat agent; creating up to 3 stores and deleting their own | Upstream URLs and credentials, other members' keys, other members' audit entries, other members' stores |
 | Store provisioner | Creating and deleting store namespaces and the store chart's objects inside them | Any namespace it did not create, including their Secrets |
 | Upstream server | Answering the calls routed to it | Instructions to the model, other upstreams' traffic, the client's API key |
 | Claude API | The chat conversation and the tool results of that turn | Upstream credentials, API keys |
@@ -32,7 +32,7 @@ Residual risk: an upstream tool that echoes its request headers back would revea
 
 ## Why client API keys are not passed to upstreams
 
-The gateway authenticates the member with their API key and then calls the upstream with the upstream's own credential. The key stops at the gateway.
+The gateway authenticates the member with their API key or OAuth access token and then calls the upstream with the upstream's own credential. The key or token stops at the gateway.
 
 - An upstream is a third party to the team. If keys were forwarded, every upstream, and anyone who compromised one, would collect every member's gateway key and could replay it against the gateway to call every other upstream as that member.
 - Upstreams do not understand gateway keys. Forwarding them would either fail or tempt upstreams to trust a token they cannot verify.
@@ -90,6 +90,13 @@ Members create stores from the dashboard, and a separate provisioner turns each 
 - One store cannot reach another. Each woo-mcp may connect only to its own WordPress and DNS (egress NetworkPolicy), and each store's MariaDB and WordPress accept connections only from their own namespace (and WordPress from the Ingress controller). Each store has its own generated Secret, so a leaked key of one store does not open another. WordPress and the setup Job may reach the internet on ports 80 and 443, because they download WooCommerce, but no private address; a compromised WordPress can reach the internet and other stores' public storefronts, but not their databases, the gateway's namespace or a metadata endpoint.
 - Store names are user input. They are validated (60 characters, no control characters), turned into a DNS-label slug, and passed to Helm through a values file on stdin, never through a command line or `--set`.
 - A store's wp-admin password is in its Secret only. Members do not see it in the dashboard; whoever operates the cluster reads it with `kubectl`.
+
+## OAuth clients
+
+- Open registration. Anyone who can reach the gateway can register a client; that alone grants nothing. Registrations that never get a grant are deleted after a day, so they cannot grow without bound, but a burst of them is not rate limited.
+- Consent phishing. A registered app chooses its own name, so an attacker can register "Claude Code" with a redirect URI they control and send a member the authorization link. The consent page says the name is the app's own claim and shows the host the browser returns to; a member who allows it gives that host a token for their tools. Revoking the grant on the API keys page stops it at once, and every call it made is in the audit log under its label.
+- Stolen codes and tokens. A code is useless without the PKCE verifier, works once and expires in 2 minutes. The redirect carries `iss`, so a client talking to several authorization servers can tell which one answered. A stolen access token works for at most an hour unless the grant is revoked first. A stolen refresh token keeps working until the grant is revoked or the real client refreshes, which makes the stolen one fail; reuse of an old refresh token is refused but does not revoke the grant.
+- Tokens stay at the gateway like API keys: they are never forwarded to upstreams, and only their hashes are stored.
 
 ## Other gaps
 

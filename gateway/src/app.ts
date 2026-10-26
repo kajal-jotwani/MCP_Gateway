@@ -13,6 +13,14 @@ import { writeAuditEntry } from './audit.js';
 import type { Queryable } from './db.js';
 import { callerAuthInfo } from './mcpEndpoint.js';
 import { recordToolCall } from './metrics.js';
+import {
+  createOAuthRouter,
+  isOAuthAccessToken,
+  oauthIssuerFor,
+  resourceMetadataUrl,
+  verifyOAuthAccessToken,
+} from './oauth.js';
+import type { RejectedAccessToken } from './oauth.js';
 import type { Caller } from './toolCalls.js';
 
 export interface AppDeps extends ApiDeps {
@@ -36,14 +44,20 @@ function bearerToken(req: Request): string | undefined {
   return header?.startsWith('Bearer ') ? header.slice('Bearer '.length).trim() : undefined;
 }
 
-type McpRejection = { rejected: 'missing' } | RejectedKey;
+type McpRejection = { rejected: 'missing' } | RejectedKey | RejectedAccessToken;
 
-/** The caller behind the request's API key, or why the request is refused. */
+/** The caller behind the request's API key or OAuth access token, or why the request is refused. */
 async function authenticateMcpRequest(
   db: Queryable,
   key: string | undefined,
 ): Promise<Caller | McpRejection> {
   if (!key) return { rejected: 'missing' };
+  if (isOAuthAccessToken(key)) {
+    const verified = await verifyOAuthAccessToken(db, key);
+    return 'rejected' in verified
+      ? verified
+      : { member: verified.member, via: 'mcp', keyPrefix: verified.keyPrefix };
+  }
   const verified = await verifyApiKey(db, key);
   return 'rejected' in verified
     ? verified
@@ -55,6 +69,10 @@ const REJECTION_REASONS = {
   unknown: 'Unknown API key',
   revoked: 'Revoked API key',
   member_deactivated: 'API key of a deactivated member',
+  oauth_unknown: 'Unknown OAuth token',
+  oauth_expired: 'Expired OAuth token',
+  oauth_revoked: 'OAuth token of a revoked app',
+  oauth_member_deactivated: 'OAuth token of a deactivated member',
 } as const;
 
 interface JsonRpcRequest {
@@ -80,6 +98,7 @@ function jsonRpcRequestsIn(body: unknown): JsonRpcRequest[] {
  */
 async function rejectMcpRequest(
   db: Queryable,
+  challenge: string,
   req: Request,
   res: Response,
   key: string | undefined,
@@ -93,7 +112,7 @@ async function rejectMcpRequest(
     }
     await writeAuditEntry(db, {
       memberId: 'memberId' in rejection ? rejection.memberId : undefined,
-      keyPrefix: key ? displayPrefixOf(key) : undefined,
+      keyPrefix: 'keyPrefix' in rejection ? rejection.keyPrefix : key && displayPrefixOf(key),
       via: 'mcp',
       tool: typeof tool === 'string' ? tool.slice(0, 128) : undefined,
       durationMs: 0,
@@ -101,12 +120,14 @@ async function rejectMcpRequest(
       reason: `${REJECTION_REASONS[rejection.rejected]} (${request.method.slice(0, 64)}).`,
     });
   }
+  // The challenge names the resource metadata, so OAuth clients can find the authorization server
+  // (RFC 9728). invalid_token tells a client with an expired access token to refresh it.
   res
     .status(401)
-    .set('www-authenticate', 'Bearer')
+    .set('www-authenticate', key ? `Bearer error="invalid_token", ${challenge}` : `Bearer ${challenge}`)
     .json({
       jsonrpc: '2.0',
-      error: { code: -32001, message: 'Missing, unknown or revoked API key.' },
+      error: { code: -32001, message: 'Missing, unknown, expired or revoked API key or token.' },
       id: requests.length === 1 ? requests[0]!.id : null,
     });
 }
@@ -137,8 +158,8 @@ function handleError(error: unknown, req: Request, res: Response, next: NextFunc
 }
 
 /**
- * The gateway's HTTP surface: /mcp and /mcp/search for MCP clients with an API key, /api and the dashboard for people,
- * and the probes. /readyz checks only the database, so a dead upstream never takes the gateway out of
+ * The gateway's HTTP surface: /mcp and /mcp/search for MCP clients with an API key or OAuth token,
+ * the OAuth endpoints, /api and the dashboard for people, and the probes. /readyz checks only the database, so a dead upstream never takes the gateway out of
  * service.
  */
 export function createApp(deps: AppDeps): Express {
@@ -157,6 +178,10 @@ export function createApp(deps: AppDeps): Express {
     res.type('text/plain').send('ok');
   });
 
+  const issuer = oauthIssuerFor(deps.publicUrl);
+  const challenge = `resource_metadata="${resourceMetadataUrl(issuer)}"`;
+  app.use(createOAuthRouter(deps.db, issuer));
+
   const onerror = (error: Error) =>
     console.error(JSON.stringify({ event: 'mcp_error', message: error.message }));
   const mcpRoutes = { '/mcp': deps.mcpHandler, '/mcp/search': deps.searchMcpHandler };
@@ -165,7 +190,7 @@ export function createApp(deps: AppDeps): Express {
     app.all(path, express.json({ limit: '4mb' }), async (req, res) => {
       const key = bearerToken(req);
       const caller = await authenticateMcpRequest(deps.db, key);
-      if ('rejected' in caller) return rejectMcpRequest(deps.db, req, res, key, caller);
+      if ('rejected' in caller) return rejectMcpRequest(deps.db, challenge, req, res, key, caller);
       await mcp(Object.assign(req, { auth: callerAuthInfo(caller) }), res, req.body);
     });
   }

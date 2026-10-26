@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 
 import { api, useAction, useApi } from './api';
-import type { ApiKey, Member } from './api';
+import type { ApiKey, Member, OAuthGrant } from './api';
 import { CopyField, ErrorText, formatTime } from './ui';
 
 /** A member's own API keys. Admins can also see everyone's, and issue and revoke keys for anyone. */
@@ -38,7 +38,81 @@ export function KeysPage({ member: me }: { member: Member }) {
       {keys.data && keys.data.keys.length > 0 && (
         <KeyTable keys={keys.data.keys} owners={showAll ? members : undefined} onChanged={keys.reload} />
       )}
+      <ConnectedApps showAll={showAll} owners={members} />
     </>
+  );
+}
+
+/** Apps signed in through OAuth instead of with a key. Revoking one refuses its next request. */
+function ConnectedApps({ showAll, owners }: { showAll: boolean; owners: Member[] }) {
+  const grants = useApi<{ grants: OAuthGrant[] }>(showAll ? '/oauth/grants?memberId=all' : '/oauth/grants');
+  const emails = new Map(owners.map((member) => [member.id, member.email]));
+  return (
+    <>
+      <h2>{showAll ? 'All connected apps' : 'Your connected apps'}</h2>
+      <p className="muted">
+        Clients that support OAuth need only the endpoint URL: they open the dashboard to sign in, and you
+        allow them there.
+      </p>
+      <ErrorText message={grants.error} />
+      {grants.data?.grants.length === 0 && <p className="muted">No connected apps.</p>}
+      {grants.data && grants.data.grants.length > 0 && (
+        <table>
+          <thead>
+            <tr>
+              <th>App</th>
+              {showAll && <th>Member</th>}
+              <th>Audit label</th>
+              <th>Allowed</th>
+              <th>Last used</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {grants.data.grants.map((grant) => (
+              <GrantRow
+                key={grant.id}
+                grant={grant}
+                owner={showAll ? (emails.get(grant.memberId) ?? 'removed member') : undefined}
+                onChanged={grants.reload}
+              />
+            ))}
+          </tbody>
+        </table>
+      )}
+    </>
+  );
+}
+
+function GrantRow({ grant, owner, onChanged }: { grant: OAuthGrant; owner?: string; onChanged: () => void }) {
+  const { busy, error, run } = useAction();
+  const revoke = () => {
+    if (!window.confirm(`Revoke ${grant.clientName}? It is rejected from its next request.`)) return;
+    void run(async () => {
+      await api('DELETE', `/oauth/grants/${grant.id}`);
+      onChanged();
+    });
+  };
+  return (
+    <tr>
+      <td>{grant.clientName}</td>
+      {owner !== undefined && <td>{owner}</td>}
+      <td>
+        <code>{grant.label}</code>
+      </td>
+      <td>{formatTime(grant.createdAt)}</td>
+      <td>{formatTime(grant.lastUsedAt)}</td>
+      <td>
+        {grant.revokedAt ? (
+          `Revoked ${formatTime(grant.revokedAt)}`
+        ) : (
+          <button type="button" className="danger" disabled={busy} onClick={revoke}>
+            Revoke
+          </button>
+        )}
+        <ErrorText message={error} />
+      </td>
+    </tr>
   );
 }
 

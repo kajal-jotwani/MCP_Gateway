@@ -65,15 +65,18 @@ export function App() {
     );
   }, []);
 
+  // Signing in on the OAuth authorization page stays there, to continue to the app's request.
+  const authorizing = path === '/oauth/authorize';
   const signedIn = (signedInMember: Member) => {
     setMember(signedInMember);
-    navigate('/servers');
+    if (!authorizing) navigate('/servers');
   };
 
   if (path === '/invite') return <InvitePage onAccepted={signedIn} />;
   if (sessionError) return <ErrorText message={sessionError} />;
   if (member === undefined) return null;
   if (member === null) return <LoginPage onSignedIn={signedIn} />;
+  if (authorizing) return <AuthorizePage member={member} />;
 
   const pages = PAGES.filter((page) => !page.adminOnly || member.role === 'admin');
   const page = pages.find((candidate) => candidate.path === path) ?? pages[0]!;
@@ -158,6 +161,68 @@ function LoginPage({ onSignedIn }: { onSignedIn: (member: Member) => void }) {
           Sign in
         </button>
       </form>
+    </main>
+  );
+}
+
+/**
+ * The consent step of an MCP client's OAuth sign-in: shows which app asks to use the gateway as the
+ * signed-in member and sends the decision. The gateway answers with where to send the browser next.
+ */
+function AuthorizePage({ member }: { member: Member }) {
+  const [search] = useState(() => window.location.search);
+  const [request, setRequest] = useState<{ clientName: string; redirectTo: string }>();
+  const [requestError, setRequestError] = useState<string>();
+  const { busy, error, run } = useAction();
+
+  useEffect(() => {
+    api<{ clientName: string; redirectTo: string } | { redirectUrl: string }>(
+      'GET',
+      `/oauth/authorization${search}`,
+    ).then(
+      (answer) => {
+        if ('redirectUrl' in answer) window.location.assign(answer.redirectUrl);
+        else setRequest(answer);
+      },
+      (failure: Error) => setRequestError(failure.message),
+    );
+  }, [search]);
+
+  const decide = (approve: boolean) =>
+    void run(async () => {
+      const { redirectUrl } = await api<{ redirectUrl: string }>('POST', '/oauth/authorization', {
+        search,
+        approve,
+      });
+      window.location.assign(redirectUrl);
+    });
+
+  return (
+    <main className="narrow">
+      <h1>Allow an app</h1>
+      <ErrorText message={requestError} />
+      {request && (
+        <>
+          <p>
+            An app that calls itself <strong>{request.clientName}</strong> asks to use the gateway&apos;s
+            tools as you ({member.email}). Its calls are audited under your name, and you can revoke it on the
+            API keys page.
+          </p>
+          <p>
+            After you decide, your browser goes to <code>{request.redirectTo}</code>. Allow only if you just
+            started connecting an app there.
+          </p>
+          <ErrorText message={error} />
+          <div className="row">
+            <button type="button" disabled={busy} onClick={() => decide(true)}>
+              Allow
+            </button>
+            <button type="button" disabled={busy} onClick={() => decide(false)}>
+              Deny
+            </button>
+          </div>
+        </>
+      )}
     </main>
   );
 }

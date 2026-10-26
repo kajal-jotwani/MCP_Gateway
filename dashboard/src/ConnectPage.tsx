@@ -23,6 +23,11 @@ export function ConnectPage() {
         {KEY_PLACEHOLDER} is.
       </p>
       <CopyField label="MCP endpoint" value={endpoint} />
+      <p className="muted">
+        Clients that support MCP&apos;s OAuth sign-in can connect with the endpoint alone, without a key: they
+        open this dashboard, you sign in and allow them, and they appear under connected apps on the API keys
+        page. OAuth clients may require HTTPS, which the local setup does not have.
+      </p>
 
       <h2>Claude Code</h2>
       <CopyField

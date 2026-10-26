@@ -19,6 +19,12 @@ function caller(entry: AuditEntry): string {
   return entry.keyPrefix ? `unknown key urk_${entry.keyPrefix}…` : 'no key';
 }
 
+function via(entry: AuditEntry): string {
+  if (entry.via === 'chat') return 'Chat';
+  // Calls with an OAuth token carry the grant's label, as listed under connected apps.
+  return entry.keyPrefix?.startsWith('oauth:') ? `OAuth app ${entry.keyPrefix}` : 'MCP client';
+}
+
 /** Every tool call, newest first. Admins see the whole team's calls; members see their own. */
 export function AuditPage({ member }: { member: Member }) {
   const [entries, setEntries] = useState<AuditEntry[]>([]);
@@ -70,7 +76,7 @@ export function AuditPage({ member }: { member: Member }) {
             <tr key={entry.id}>
               <td>{formatTime(entry.at)}</td>
               <td>{caller(entry)}</td>
-              <td>{entry.via === 'chat' ? 'Chat' : 'MCP client'}</td>
+              <td>{via(entry)}</td>
               <td>{entry.upstreamName ?? '–'}</td>
               <td>{entry.tool ? <code>{entry.tool}</code> : '–'}</td>
               <td>

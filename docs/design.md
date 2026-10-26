@@ -168,7 +168,7 @@ Cache invalidation: the per-upstream tool cache is replaced on every successful 
 
 Invites without email: an admin enters an email and role, the gateway creates a one-time token (32 random bytes, stored as SHA-256, expires in 72 h) and shows a link `https://<dashboard>/invite#<token>` once. The token is in the URL fragment, which browsers never send to a server, so it stays out of access logs; the dashboard posts it in a request body. The admin sends the link any way they like. Opening it lets the invitee set a name and password. The token is deleted on use.
 
-Alternatives considered: OAuth/OIDC login (needs an identity provider for a local demo; listed as a later extension), magic links (need email).
+Alternatives considered: OIDC login through an identity provider (one more service for a local demo), magic links (need email). MCP clients can sign in with OAuth, but that is the gateway acting as authorization server for clients, not a way for people to log in (see OAuth for MCP clients).
 
 ### API keys
 
@@ -179,6 +179,27 @@ Storage: SHA-256 of the full key, with a unique index. Verification hashes the p
 Why a fast hash: password hashes (scrypt, argon2) exist to slow down guessing of low-entropy secrets. A key with 256 bits of randomness cannot be guessed whatever the hash speed, so a slow hash would only add tens of milliseconds and CPU to every MCP request. SHA-256 also allows lookup by hash, so there is no per-key comparison loop and no timing signal on the secret.
 
 Keys are shown once on creation. Members create and revoke their own keys. Admins can create a key for a member (shown once to the admin) and revoke any key. A call with a revoked key, or with a deactivated member's key, still matches a stored hash, so its rejection is audited under that member.
+
+### OAuth for MCP clients
+
+Clients that implement MCP's authorization flow can connect with the endpoint URL alone. The gateway is both the protected resource (`/mcp`) and its own authorization server, and the member approves the client in the dashboard. API keys keep working unchanged.
+
+| Option | For | Against |
+|---|---|---|
+| The gateway as its own authorization server | No new service; approval uses the dashboard session; tokens are rows next to API keys, so revocation and audit work the same way | The gateway implements the OAuth endpoints itself (the MCP SDK v2 has resource-server helpers but no authorization server) |
+| External identity provider (Keycloak, Dex, Auth0) | Standard login, SSO | One more stateful workload, and member and role data would live in two places |
+
+**Decision: the gateway is the authorization server.** What it serves:
+
+- Discovery. A 401 from `/mcp` or `/mcp/search` carries `WWW-Authenticate: Bearer resource_metadata="<origin>/.well-known/oauth-protected-resource/mcp"` (RFC 9728), with `error="invalid_token"` when a token was sent. That document names the resource `<origin>/mcp` and the authorization server `<origin>`, whose metadata is at `/.well-known/oauth-authorization-server` (RFC 8414).
+- Client registration. `POST /oauth/register` (RFC 7591) is open, as MCP clients expect. Every client is public, gets no secret and must use PKCE. Redirect URIs must be https, http on a loopback address (matched on any port, RFC 8252, because CLI clients pick a free port), or an app's own scheme such as `cursor://`. Client ID metadata documents are not supported: the gateway would have to fetch arbitrary URLs, and the SDK clients fall back to registration.
+- Authorization. `/oauth/authorize` is a dashboard page. The member signs in if needed and sees the name the app gave itself and the host it returns to. A wrong client or redirect URI is shown on the page and never redirected to; other errors go back to the app. Only `response_type=code` with an S256 `code_challenge` is accepted, and a `resource` other than `<origin>/mcp` is refused (RFC 8707). Approval creates a one-time code (2 minutes, stored hashed) and the redirect carries `iss` (RFC 9207).
+- Tokens. `POST /oauth/token` exchanges the code after checking the client, redirect URI and PKCE verifier, and deletes it as it reads it. Each approval is a grant with one access token (`uoa_`, 1 hour) and one refresh token (`uor_`, 30 days from the last refresh), both 256-bit random and stored as SHA-256. A refresh replaces both, so an old refresh token stops working.
+- Calls. `/mcp` sees the `uoa_` prefix and looks the token up on every request, like an API key: a revoked grant, an expired token or a deactivated member is refused and audited. Audit entries carry the grant's label, `oauth:<first 8 characters of the grant id>`, which the API keys page shows next to the app under connected apps. Members revoke their own grants; admins revoke anyone's.
+
+There are no scopes: a token can do what the member can, like an API key. Tool permissions still apply per call.
+
+HTTPS: OAuth 2.1 requires it for the authorization server except on loopback, and the MCP SDK v2 client refuses a non-loopback http token endpoint. The local setup is `http://app.localtest.me`, so SDK v2 clients cannot use OAuth there and keep using API keys. With TLS (see Production changes) it works for every client. The automated test runs the full flow with the SDK's own client against a loopback gateway.
 
 ### Chat agent as the logged-in member
 
@@ -440,7 +461,7 @@ Isolation: the store chart's NetworkPolicies already admit MariaDB connections o
 External client `tools/call`:
 
 1. Client POSTs to `https://app.<domain>/mcp` with `Authorization: Bearer urk_...`.
-2. Gateway hashes the key and loads the member. Missing, unknown or revoked key, or a deactivated member's key: HTTP 401 and an audit entry `rejected` with the key's display prefix. A revoked key or a deactivated member's key matches a stored hash, so the entry is attributed to that member; an unknown key has no member.
+2. Gateway hashes the key (or an OAuth access token, prefix `uoa_`) and loads the member. Missing, unknown or revoked key, or a deactivated member's key: HTTP 401 and an audit entry `rejected` with the key's display prefix. A revoked key or a deactivated member's key matches a stored hash, so the entry is attributed to that member; an unknown key has no member.
 3. `callTool` (`gateway/src/toolCalls.ts`) checks `mayUseTools(member)` and the rate limit, then `registry.resolve` maps `list_orders` to the WooCommerce upstream and its original tool name.
 4. The registry's client for that upstream calls `list_orders` with the upstream's static credential, if any. The client's API key is not forwarded.
 5. woo-mcp signs a REST request to WordPress, trims the response and returns it.
@@ -460,6 +481,9 @@ admin_only_tools  upstream_id (deleted with its upstream), tool (the upstream's 
 stores         id, slug (unique, DNS label), name, url, owner_id, status (provisioning|ready|failed|deleting), reason, attempt, attempt_started_at, created_at, updated_at
 bootstrap      action, done_at
 tool_call_windows  member_id, window_start (a minute), calls
+oauth_clients  id, name, redirect_uris, created_at
+oauth_codes    code_hash, client_id, member_id, redirect_uri, code_challenge, expires_at
+oauth_grants   id, client_id, member_id, access_token_hash (unique), access_expires_at, refresh_token_hash (unique), refresh_expires_at, created_at, last_used_at, revoked_at
 audit_entries  id, at, member_id (nullable), key_prefix (nullable), via (mcp|chat), upstream_id (nullable, no foreign key), upstream_name, tool, duration_ms, outcome (succeeded|failed|timed_out|rejected), reason
 ```
 
@@ -519,6 +543,7 @@ Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and ever
 | Many tools | `/mcp/search` with `search_tools` and `call_tool`; chat switches above 40 tools |
 | Tool permissions | `upstreams.admin_only` and `admin_only_tools`; `mayCallTool` in listing (`toolsFor`) and in the single call path |
 | Observability | Failure reasons from the error cause chain; per-server stats from `audit_entries`; Prometheus `/metrics` on port 9464 |
+| OAuth | Gateway as authorization server: RFC 9728 and 8414 discovery, open registration of public clients, PKCE S256 codes approved in the dashboard, hashed revocable grants audited as `oauth:<id>` |
 | Scaling | Two replicas; PostgreSQL `LISTEN/NOTIFY` on `gateway_changes` for admin and provisioner changes; stateless MCP endpoint |
 | Rate limit | `tool_call_windows` counter per member per minute, checked in the single call path |
 | Multi-store bonus | `stores` table and Stores page; provisioner running Helm per namespace `store-<slug>`; RBAC bound per store namespace plus an admission policy; quota, LimitRange, per-member limit and timeout; woo-mcp egress policy; store tools always `<slug>__<tool>` |
