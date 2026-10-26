@@ -1,3 +1,4 @@
+import type { CredentialCipher } from './credentialCipher.js';
 import type { Database, Queryable } from './db.js';
 import { toolKey } from './permissions.js';
 import type { ToolRestrictions } from './permissions.js';
@@ -43,7 +44,7 @@ const PUBLIC_COLUMNS = `id, slug, name, url, auth_type AS "authType", auth_heade
   store_id AS "storeId"`;
 const UPSTREAM_COLUMNS = `${PUBLIC_COLUMNS}, auth_secret AS "authSecret"`;
 
-function toConfig(row: UpstreamRow): UpstreamConfig {
+function toConfig(row: UpstreamRow, cipher: CredentialCipher): UpstreamConfig {
   const config: UpstreamConfig = {
     id: row.id,
     slug: row.slug,
@@ -52,18 +53,49 @@ function toConfig(row: UpstreamRow): UpstreamConfig {
     enabled: row.enabled,
   };
   if (row.storeId) config.storeId = row.storeId;
-  if (row.authType === 'bearer' && row.authSecret) {
-    config.credential = { header: 'authorization', value: `Bearer ${row.authSecret}` };
-  } else if (row.authType === 'header' && row.authHeaderName && row.authSecret) {
-    config.credential = { header: row.authHeaderName, value: row.authSecret };
+  const secret = row.authSecret && cipher.decrypt(row.authSecret);
+  if (row.authType === 'bearer' && secret) {
+    config.credential = { header: 'authorization', value: `Bearer ${secret}` };
+  } else if (row.authType === 'header' && row.authHeaderName && secret) {
+    config.credential = { header: row.authHeaderName, value: secret };
   }
   return config;
 }
 
-/** Every upstream with its credential resolved to a header, for the registry. Stays in the backend. */
-export async function listUpstreamConfigs(db: Queryable): Promise<UpstreamConfig[]> {
+/**
+ * Every upstream with its credential decrypted and resolved to a header, for the registry. Stays in
+ * the backend.
+ */
+export async function listUpstreamConfigs(
+  db: Queryable,
+  cipher: CredentialCipher,
+): Promise<UpstreamConfig[]> {
   const rows = await db.query<UpstreamRow>(`SELECT ${UPSTREAM_COLUMNS} FROM upstreams ORDER BY created_at`);
-  return rows.map(toConfig);
+  return rows.map((row) => toConfig(row, cipher));
+}
+
+/**
+ * Encrypts credentials stored in clear by a gateway older than encryption at rest, and checks that
+ * every encrypted one decrypts with this key. Returns how many it encrypted. Throws
+ * CredentialDecryptError when one was encrypted with another key, so a wrong key stops the gateway at
+ * startup.
+ */
+export async function encryptStoredCredentials(db: Database, cipher: CredentialCipher): Promise<number> {
+  return db.transaction(async (tx) => {
+    const rows = await tx.query<{ id: string; authSecret: string }>(
+      `SELECT id, auth_secret AS "authSecret" FROM upstreams WHERE auth_secret IS NOT NULL FOR UPDATE`,
+    );
+    let encrypted = 0;
+    for (const { id, authSecret } of rows) {
+      if (cipher.isEncrypted(authSecret)) {
+        cipher.decrypt(authSecret);
+        continue;
+      }
+      await tx.query('UPDATE upstreams SET auth_secret = $2 WHERE id = $1', [id, cipher.encrypt(authSecret)]);
+      encrypted += 1;
+    }
+    return encrypted;
+  });
 }
 
 /** Every upstream without its secret, oldest first. */
@@ -83,21 +115,26 @@ export function slugFromName(name: string): string {
 type StoredAuth = Pick<UpstreamRow, 'authType' | 'authHeaderName' | 'authSecret'>;
 
 /**
- * The credential to store after an edit, or 'secret_required' when the edit leaves an authenticated
- * upstream without a secret. A URL change needs the secret entered again, so an edit cannot send a
- * stored credential, which nobody can read back, to a new address.
+ * The credential to store after an edit, with a new secret encrypted, or 'secret_required' when the
+ * edit leaves an authenticated upstream without a secret. A URL change needs the secret entered
+ * again, so an edit cannot send a stored credential, which nobody can read back, to a new address.
  */
 function storedAuthAfter(
   current: StoredAuth,
   change: AuthChange | undefined,
   urlChanged: boolean,
+  cipher: CredentialCipher,
 ): StoredAuth | 'secret_required' {
   if (change?.type === 'none' || (!change && current.authType === 'none')) {
     return { authType: 'none', authHeaderName: null, authSecret: null };
   }
   if (urlChanged && !change?.secret) return 'secret_required';
   const authType = change?.type ?? current.authType;
-  const authSecret = change?.secret ?? (current.authType === 'none' ? null : current.authSecret);
+  const authSecret = change?.secret
+    ? cipher.encrypt(change.secret)
+    : current.authType === 'none'
+      ? null
+      : current.authSecret;
   if (!authSecret) return 'secret_required';
   const authHeaderName =
     change?.type === 'header' ? change.headerName : change ? null : current.authHeaderName;
@@ -110,12 +147,14 @@ function storedAuthAfter(
  */
 export async function createUpstream(
   db: Queryable,
+  cipher: CredentialCipher,
   input: UpstreamInput,
 ): Promise<Upstream | 'slug_taken' | 'secret_required'> {
   const auth = storedAuthAfter(
     { authType: 'none', authHeaderName: null, authSecret: null },
     input.auth,
     false,
+    cipher,
   );
   if (auth === 'secret_required') return auth;
   const [upstream] = await db.query<Upstream>(
@@ -135,6 +174,7 @@ export async function createUpstream(
  */
 export async function updateUpstream(
   db: Database,
+  cipher: CredentialCipher,
   id: string,
   changes: Partial<UpstreamInput>,
 ): Promise<Upstream | undefined | 'slug_taken' | 'secret_required' | 'store_managed'> {
@@ -146,7 +186,7 @@ export async function updateUpstream(
     if (!current) return undefined;
     if (current.storeId && Object.keys(changes).some((field) => field !== 'enabled')) return 'store_managed';
     const url = changes.url ?? current.url;
-    const auth = storedAuthAfter(current, changes.auth, url !== current.url);
+    const auth = storedAuthAfter(current, changes.auth, url !== current.url, cipher);
     if (auth === 'secret_required') return auth;
     const [upstream] = await tx.query<Upstream>(
       `UPDATE upstreams SET slug = $2, name = $3, url = $4, auth_type = $5, auth_header_name = $6,

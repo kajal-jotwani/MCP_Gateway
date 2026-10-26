@@ -8,6 +8,7 @@ import { createApiKey, getApiKey, listApiKeys, revokeApiKey } from './apiKeys.js
 import { listAuditEntries, upstreamCallStats } from './audit.js';
 import type { UpstreamCallStats } from './audit.js';
 import { chatFailureMessage, runChatTurn } from './chat.js';
+import type { CredentialCipher } from './credentialCipher.js';
 import type { ChatEvent, ChatTurn } from './chat.js';
 import type { Database } from './db.js';
 import {
@@ -76,6 +77,8 @@ export interface ApiDeps {
   anthropic: Anthropic;
   publicUrl: URL;
   stores: { domain: string; maxPerMember: number };
+  /** Encrypts upstream credentials before they are stored. */
+  cipher: CredentialCipher;
   /** Why an upstream URL may not be used (server-side request forgery guard), or undefined. */
   checkUpstreamUrl: (url: string) => Promise<string | undefined>;
 }
@@ -328,12 +331,13 @@ export function createApiRouter({
   anthropic,
   publicUrl,
   stores,
+  cipher,
   checkUpstreamUrl,
 }: ApiDeps): Router {
   const router = express.Router();
   const secureCookie = publicUrl.protocol === 'https:';
 
-  const applyUpstreamChanges = (): Promise<void> => registry.reload(() => listUpstreamConfigs(db));
+  const applyUpstreamChanges = (): Promise<void> => registry.reload(() => listUpstreamConfigs(db, cipher));
   const assertUsableUrl = async (url: string | undefined): Promise<void> => {
     const refusal = url && (await checkUpstreamUrl(url));
     if (refusal) throw new HttpError(400, `This URL cannot be used: ${refusal}.`);
@@ -500,7 +504,7 @@ export function createApiRouter({
     if (!SLUG_PATTERN.test(derivedSlug)) {
       throw new HttpError(400, 'Enter a slug of 2-16 characters of a-z, 0-9 and -.');
     }
-    const created = await createUpstream(db, { ...input, slug: derivedSlug });
+    const created = await createUpstream(db, cipher, { ...input, slug: derivedSlug });
     if (typeof created === 'string') throw upstreamChangeRefusal(created);
     await applyUpstreamChanges();
     res.status(201).json(await upstreamResponse(created, admin));
@@ -510,7 +514,7 @@ export function createApiRouter({
     const admin = signedInAdmin(res);
     const changes = parse(upstreamPatchBody, req.body);
     await assertUsableUrl(changes.url);
-    const updated = await updateUpstream(db, parseId(req.params.id), changes);
+    const updated = await updateUpstream(db, cipher, parseId(req.params.id), changes);
     if (!updated) throw new HttpError(404, 'Not found.');
     if (typeof updated === 'string') throw upstreamChangeRefusal(updated);
     await applyUpstreamChanges();

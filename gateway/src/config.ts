@@ -19,6 +19,8 @@ export interface GatewayConfig {
   /** The chat agent's key for the Claude API. */
   anthropicApiKey: string;
   upstreamNetwork: UpstreamNetworkPolicy;
+  /** The AES-256 key upstream credentials are encrypted with in the database. */
+  credentialKey: Buffer;
   stores: {
     /** Provisioned stores are served at store-<slug>.<domain>, with the scheme of publicUrl. */
     domain: string;
@@ -70,6 +72,13 @@ const hostPatternList = z
     ),
   );
 
+// 32 random bytes in base64, as `openssl rand -base64 32` prints them.
+const aesKey = z
+  .string()
+  .trim()
+  .regex(/^[A-Za-z0-9+/]{43}=$/, 'must be 32 bytes in base64, such as the output of openssl rand -base64 32')
+  .transform((value) => Buffer.from(value, 'base64'));
+
 const databaseEnv = {
   PGHOST: z.string().min(1),
   PGPORT: z.coerce.number().int().min(1).max(65535).default(5432),
@@ -92,6 +101,7 @@ const envSchema = z.object({
   SEED_UPSTREAM_URL: httpUrl,
   ANTHROPIC_API_KEY: z.string().min(1),
   UPSTREAM_INTERNAL_HOSTS: hostPatternList.default([]),
+  UPSTREAM_CREDENTIAL_KEY: aesKey,
   STORE_DOMAIN: domainName,
   MAX_STORES_PER_MEMBER: z.coerce.number().int().min(0).max(100),
 });
@@ -145,6 +155,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): GatewayConfig {
     },
     anthropicApiKey: vars.ANTHROPIC_API_KEY,
     upstreamNetwork: { internalHosts: vars.UPSTREAM_INTERNAL_HOSTS },
+    credentialKey: vars.UPSTREAM_CREDENTIAL_KEY,
     stores: { domain: vars.STORE_DOMAIN, maxPerMember: vars.MAX_STORES_PER_MEMBER },
   };
 }

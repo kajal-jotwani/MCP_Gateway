@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -22,6 +22,7 @@ import type { Member, Role } from '../src/team.js';
 import { listStoreTasks, markStoreFailed, markStoreReady } from '../src/stores.js';
 import type { StoreTask } from '../src/stores.js';
 import { startMetricsServer } from '../src/metrics.js';
+import { createCredentialCipher } from '../src/credentialCipher.js';
 import { upstreamUrlRefusal } from '../src/upstreamNetwork.js';
 import { listUpstreamConfigs } from '../src/upstreams.js';
 import type { Upstream } from '../src/upstreams.js';
@@ -74,6 +75,8 @@ const unusedAnthropic = new Anthropic({ apiKey: 'unused', baseURL: 'http://127.0
  * Starts the gateway's HTTP app on a free port, with one upstream named WooCommerce. With the shared
  * database, the gateway starts out seeing only its own upstream row.
  */
+const cipher = createCredentialCipher(randomBytes(32));
+
 // Fake upstreams listen on loopback, which the real guard always refuses. Its own tests cover it.
 const allowEveryUrl = async (): Promise<undefined> => undefined;
 
@@ -89,7 +92,7 @@ async function startGateway(
     [`woo${upstreamCounter}`, upstream.url],
   )) as [{ id: string }];
   const registry = new UpstreamRegistry({ connectMs: 500, listMs: 500, callMs: 300 });
-  await registry.sync((await listUpstreamConfigs(database)).filter((config) => config.id === id));
+  await registry.sync((await listUpstreamConfigs(database, cipher)).filter((config) => config.id === id));
   const mcpHandler = createGatewayMcpHandler({ db: database, registry });
   const app = createApp({
     db: database,
@@ -98,6 +101,7 @@ async function startGateway(
     anthropic,
     publicUrl: new URL('http://app.localtest.me'),
     stores: { domain: 'localtest.me', maxPerMember: 2 },
+    cipher,
     checkUpstreamUrl,
     dashboardDir,
   });
@@ -601,6 +605,11 @@ describe('upstream servers', () => {
     ]);
     const listed = await admin.request('GET', '/upstreams');
     expect(JSON.stringify([created.body, listed.body])).not.toContain(NOTES_TOKEN);
+    const [stored] = await isolated.query<{ secret: string }>(
+      `SELECT auth_secret AS secret FROM upstreams WHERE slug = 'notes'`,
+    );
+    expect(stored!.secret).toMatch(/^v1:/);
+    expect(stored!.secret).not.toContain(NOTES_TOKEN);
 
     const client = await mcpClient(gateway, await newKey(isolated, await newMember('member', isolated)));
     expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual([

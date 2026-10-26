@@ -5,6 +5,7 @@ import Anthropic from '@anthropic-ai/sdk';
 
 import { createApp } from './app.js';
 import { loadConfig } from './config.js';
+import { createCredentialCipher, CredentialDecryptError } from './credentialCipher.js';
 import type { GatewayConfig } from './config.js';
 import { createPostgresDatabase, migrate, waitForDatabase } from './db.js';
 import { createGatewayMcpHandler } from './mcpEndpoint.js';
@@ -12,7 +13,7 @@ import { reportUpstreamStates, startMetricsServer } from './metrics.js';
 import { UpstreamRegistry } from './registry.js';
 import { ensureFirstAdmin } from './team.js';
 import { createGuardedFetch, upstreamUrlRefusal } from './upstreamNetwork.js';
-import { listUpstreamConfigs, seedUpstreamOnce } from './upstreams.js';
+import { encryptStoredCredentials, listUpstreamConfigs, seedUpstreamOnce } from './upstreams.js';
 
 // Upstreams are in-cluster, so a healthy one answers in milliseconds. Calls get longer because store
 // writes can be slow; woo-mcp's own 20 s store timeout fires first and returns a clearer error.
@@ -41,6 +42,17 @@ for (const migration of await migrate(db)) {
 if (await ensureFirstAdmin(db, config.firstAdmin)) {
   console.log(JSON.stringify({ event: 'first_admin_created', email: config.firstAdmin.email }));
 }
+const cipher = createCredentialCipher(config.credentialKey);
+try {
+  const encrypted = await encryptStoredCredentials(db, cipher);
+  if (encrypted) console.log(JSON.stringify({ event: 'credentials_encrypted', upstreams: encrypted }));
+} catch (error) {
+  if (!(error instanceof CredentialDecryptError)) throw error;
+  console.error(
+    'UPSTREAM_CREDENTIAL_KEY does not decrypt the stored upstream credentials. Use the key they were encrypted with.',
+  );
+  process.exit(1);
+}
 if (await seedUpstreamOnce(db, config.seedUpstream)) {
   console.log(JSON.stringify({ event: 'upstream_seeded', upstream: config.seedUpstream.slug }));
 }
@@ -54,6 +66,7 @@ const app = createApp({
   anthropic: new Anthropic({ apiKey: config.anthropicApiKey }),
   publicUrl: config.publicUrl,
   stores: config.stores,
+  cipher,
   checkUpstreamUrl: (url) => upstreamUrlRefusal(url, config.upstreamNetwork),
   dashboardDir: DASHBOARD_DIR,
 });
@@ -63,7 +76,7 @@ const server = app.listen(config.port, () => {
 reportUpstreamStates(() => registry.states().values());
 const metricsServer = startMetricsServer(config.metricsPort);
 
-const loadUpstreams = () => listUpstreamConfigs(db);
+const loadUpstreams = () => listUpstreamConfigs(db, cipher);
 // Connecting to upstreams happens after the server is up, so readiness never waits on an upstream.
 await registry.reload(loadUpstreams);
 // Each refresh also re-reads the upstreams table, because during a rolling update the old pod may

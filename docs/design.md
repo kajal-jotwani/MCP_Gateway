@@ -306,6 +306,18 @@ Options considered: an allow list of URLs (safest, but every new server needs a 
 
 Tradeoff: an upstream on a private network, such as another team's MCP server on the VPS provider's internal network, needs its host added to `upstreamNetwork.internalHosts` before it can be registered.
 
+### Upstream credentials at rest
+
+Options considered: PostgreSQL's `pgcrypto` (the key would travel in every query and sit in the database's logs), one Kubernetes Secret per upstream (the gateway would need Kubernetes API rights, which it deliberately has none of), or encryption in the gateway with a key from a Secret.
+
+**Decision: AES-256-GCM in the gateway,** with the key `UPSTREAM_CREDENTIAL_KEY` (32 random bytes) from `gateway-credentials`.
+
+- A secret is encrypted when an admin saves it and stored as `v1:<iv>:<tag>:<ciphertext>`, with a fresh random 96-bit IV per value. GCM's tag means a value encrypted with another key, or changed in the database, fails to decrypt instead of producing garbage. The `v1` prefix leaves room for key rotation without guessing at old values.
+- It is decrypted only when the upstream list is loaded into the registry, which turns it into the header the MCP client sends. The API never decrypts it; responses still say only whether a credential is set.
+- On start, the gateway encrypts any credential an older version stored in clear, and checks that every stored credential decrypts. A wrong key stops the gateway with `UPSTREAM_CREDENTIAL_KEY does not decrypt the stored upstream credentials`, so a mistyped Secret never silently sends broken credentials.
+
+What it protects: a database dump, a backup, or read access to PostgreSQL alone no longer yields upstream credentials. What it does not: a compromised gateway pod holds both the key and the database password. Rotation is not built: it would re-encrypt every value under a `v2` key, the same way the start-up step encrypts clear values.
+
 ### Tool permissions
 
 Options considered: per-member allow lists, per-role rules, or scopes on API keys. The brief's example (members read orders, only admins create products or change order status) is a rule about roles, and the team has two roles, so a rule per role covers it without a policy language.
@@ -395,7 +407,7 @@ bootstrap      action, done_at
 audit_entries  id, at, member_id (nullable), key_prefix (nullable), via (mcp|chat), upstream_id (nullable, no foreign key), upstream_name, tool, duration_ms, outcome (succeeded|failed|timed_out|rejected), reason
 ```
 
-`upstreams.auth_secret` is write-only through the API: responses say whether a credential is set, never what it is. Encrypting it at rest is a hardening extension. Audit entries copy `upstream_name` and the original `tool` name as text so entries stay readable after an upstream is removed. `upstream_id` has no foreign key, so a call that finishes while its upstream is being removed is still audited.
+`upstreams.auth_secret` is write-only through the API: responses say whether a credential is set, never what it is. It is stored encrypted with AES-256-GCM (see Upstream credentials at rest). Audit entries copy `upstream_name` and the original `tool` name as text so entries stay readable after an upstream is removed. `upstream_id` has no foreign key, so a call that finishes while its upstream is being removed is still audited.
 
 The WooCommerce upstream is inserted on the gateway's first start from chart values (name, slug, URL of the woo-mcp Service) (G7). A one-row `bootstrap` table records that this happened, so an admin who later renames or removes it does not get it back on restart.
 
@@ -447,6 +459,7 @@ Image tags are pinned in `values.yaml`. The gateway, woo-mcp, notes-mcp and ever
 | T4, D9 | `writeAuditEntry` in the single tool-call path, audit page in the dashboard |
 | C1, C2, C3 | Claude Messages API loop in the gateway using the same path, tool calls streamed to the UI, key in a Secret |
 | SSRF guard | Address checks in the upstream clients' DNS lookup on every connection and on save; internal host list from the chart |
+| Credentials at rest | AES-256-GCM in the gateway, key `UPSTREAM_CREDENTIAL_KEY` from `gateway-credentials`; clear values encrypted on start |
 | Tool permissions | `upstreams.admin_only` and `admin_only_tools`; `mayCallTool` in listing (`toolsFor`) and in the single call path |
 | Observability | Failure reasons from the error cause chain; per-server stats from `audit_entries`; Prometheus `/metrics` on port 9464 |
 | Multi-store bonus | `stores` table and Stores page; provisioner running Helm per namespace `store-<slug>`; RBAC bound per store namespace plus an admission policy; quota, LimitRange, per-member limit and timeout; woo-mcp egress policy; store tools always `<slug>__<tool>` |

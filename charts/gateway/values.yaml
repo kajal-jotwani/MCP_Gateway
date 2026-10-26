@@ -1,6 +1,6 @@
 # Secrets created by the operator before install. Keys are listed in the README.
 secrets:
-  # POSTGRES_PASSWORD, BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_PASSWORD
+  # POSTGRES_PASSWORD, BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_PASSWORD, UPSTREAM_CREDENTIAL_KEY
   gateway: gateway-credentials
   # NOTES_TOKEN, the bearer token notes-mcp requires. Admins enter the same value in the dashboard.
   notes: notes-credentials

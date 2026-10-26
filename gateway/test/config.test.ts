@@ -14,6 +14,7 @@ const validEnv = {
   SEED_UPSTREAM_SLUG: 'woocommerce',
   SEED_UPSTREAM_URL: 'http://woo-mcp.store.svc.cluster.local:3000/mcp',
   ANTHROPIC_API_KEY: 'test-anthropic-key',
+  UPSTREAM_CREDENTIAL_KEY: Buffer.alloc(32, 7).toString('base64'),
   STORE_DOMAIN: 'localtest.me',
   MAX_STORES_PER_MEMBER: '3',
 };
@@ -29,6 +30,22 @@ describe('loadConfig', () => {
       slug: 'woocommerce',
       url: 'http://woo-mcp.store.svc.cluster.local:3000/mcp',
     });
+  });
+
+  it('reads the credential key and the internal host patterns', () => {
+    const config = loadConfig({
+      ...validEnv,
+      UPSTREAM_INTERNAL_HOSTS: 'notes-mcp, Woo-MCP.store-*.svc.cluster.local',
+    });
+    expect(config.credentialKey).toEqual(Buffer.alloc(32, 7));
+    expect(config.upstreamNetwork.internalHosts).toEqual(['notes-mcp', 'woo-mcp.store-*.svc.cluster.local']);
+    expect(loadConfig(validEnv).upstreamNetwork.internalHosts).toEqual([]);
+    expect(() =>
+      loadConfig({ ...validEnv, UPSTREAM_CREDENTIAL_KEY: Buffer.alloc(16).toString('base64') }),
+    ).toThrow(/UPSTREAM_CREDENTIAL_KEY/);
+    expect(() => loadConfig({ ...validEnv, UPSTREAM_INTERNAL_HOSTS: 'http://x/' })).toThrow(
+      /UPSTREAM_INTERNAL_HOSTS/,
+    );
   });
 
   it('names every invalid variable without echoing secret values', () => {

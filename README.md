@@ -71,7 +71,8 @@ kubectl create namespace gateway
 kubectl -n gateway create secret generic gateway-credentials \
   --from-literal=POSTGRES_PASSWORD="$(openssl rand -hex 24)" \
   --from-literal=BOOTSTRAP_ADMIN_EMAIL=you@example.com \
-  --from-literal=BOOTSTRAP_ADMIN_PASSWORD="$(openssl rand -base64 18)"
+  --from-literal=BOOTSTRAP_ADMIN_PASSWORD="$(openssl rand -base64 18)" \
+  --from-literal=UPSTREAM_CREDENTIAL_KEY="$(openssl rand -base64 32)"
 kubectl -n gateway create secret generic notes-credentials \
   --from-literal=NOTES_TOKEN="$(openssl rand -hex 32)"
 
@@ -84,7 +85,7 @@ unset ANTHROPIC_API_KEY
 | Secret | Keys | Used by |
 |---|---|---|
 | `store-credentials` | MariaDB passwords, WordPress admin password and salts, the WooCommerce REST key and secret for woo-mcp | MariaDB, WordPress, setup Job, woo-mcp |
-| `gateway-credentials` | PostgreSQL password, first admin's email and password | PostgreSQL, gateway |
+| `gateway-credentials` | PostgreSQL password, first admin's email and password, `UPSTREAM_CREDENTIAL_KEY` (the AES-256 key upstream credentials are encrypted with in PostgreSQL) | PostgreSQL, gateway |
 | `notes-credentials` | `NOTES_TOKEN`, the bearer token notes-mcp requires | notes-mcp; an admin enters the same value in the dashboard |
 | `llm-credentials` | `ANTHROPIC_API_KEY` | the chat agent |
 
@@ -340,6 +341,13 @@ Every upgrade is a change to values or an image tag followed by the same `helm u
 | woo-mcp | `images.wooMcp` in the store chart | Rolling update: the new pod is ready before the old one stops. The gateway reconnects on its next refresh (15 s) | `helm rollback store <revision> -n store` |
 | Gateway and dashboard | `images.gateway` in the gateway chart | Rolling update. Migrations run when the new pod starts | `helm rollback gateway <revision> -n gateway`; migrations only add, so the old image works on the new schema |
 | A provisioned store | Same values as the store chart, applied to that store's release | As for the store | `helm rollback store <revision> -n store-<slug>` |
+
+A gateway installed before upstream credentials were encrypted needs the key in its Secret before the upgrade; the new gateway encrypts the stored credentials on its first start. Keep the key: without it the stored credentials cannot be decrypted and must be entered again.
+
+```sh
+kubectl -n gateway patch secret gateway-credentials --type merge \
+  -p "{\"stringData\":{\"UPSTREAM_CREDENTIAL_KEY\":\"$(openssl rand -base64 32)\"}}"
+```
 
 Upgrade the store before the gateway when a release changes both, so the gateway never calls tools that the running woo-mcp does not have yet.
 
